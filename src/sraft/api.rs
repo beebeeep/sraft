@@ -25,23 +25,20 @@ impl Sraft for super::SraftNode {
     }
 
     async fn get(&self, req: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
-        let d = self.data.read().await;
-        match d.get(&req.into_inner().key) {
-            Some(v) => Ok(Response::new(GetResponse { value: v.to_vec() })),
-            None => Err(Status::not_found("key not found")),
+        match self.get(req.into_inner().key).await {
+            Ok(Some(v)) => Ok(Response::new(GetResponse { value: v.to_vec() })),
+            Ok(None) => Err(Status::not_found("key not found")),
+            Err(err) => Err(Status::internal(format!("getting key: {err:#}"))),
         }
     }
 
     async fn set(&self, req: Request<SetRequest>) -> Result<Response<SetResponse>, Status> {
-        let r = req.into_inner();
-        let mut d = self.data.write().await;
-        match d.insert(r.key, r.value) {
-            Some(v) => Ok(Response::new(SetResponse {
-                previous_value: Some(PreviousValue::Value(v)),
+        let req = req.into_inner();
+        match self.set(req.key, req.value).await {
+            Ok(v) => Ok(Response::new(SetResponse {
+                previous_value: v.map(|x| PreviousValue::Value(x)),
             })),
-            None => Ok(Response::new(SetResponse {
-                previous_value: None,
-            })),
+            Err(err) => Err(Status::internal(format!("setting key: {err:#}"))),
         }
     }
 }
