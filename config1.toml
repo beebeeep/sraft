@@ -1,0 +1,11 @@
+peer_id = 0
+port = 50051
+[[peers]]
+  id = 0
+  addr = "[::1]:50051"
+[[peers]]
+  id = 1
+  addr = "[::1]:50052"
+[[peers]]
+  id = 1
+  addr = "[::1]:50053"

@@ -13,6 +13,7 @@ use tokio::time::Instant;
 use tokio::time::Sleep;
 use tonic::transport::Channel;
 use tracing::error;
+use tracing::info;
 
 use crate::sraft::api::grpc::RequestVoteRequest;
 
@@ -179,6 +180,7 @@ impl StateMachine {
     }
 
     fn convert_to_candidate(&mut self) {
+        info!(peer_id = self.id, "convering to candidate");
         self.state = ServerState::Candidate;
         self.current_term += 1;
         self.voted_for = Some(self.id);
