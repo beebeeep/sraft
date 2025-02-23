@@ -1,5 +1,8 @@
+use std::collections::HashMap;
+
 use crate::config::Config;
 use anyhow::Result;
+use api::grpc;
 use state_machine::{Message, StateMachine};
 use tokio::sync::{mpsc, oneshot};
 use tracing::info;
@@ -15,37 +18,54 @@ impl SraftNode {
     pub fn new(cfg: &Config) -> Result<Self> {
         let (send, recv) = mpsc::channel(8);
 
-        let mut sm = StateMachine::new(
-            cfg.peer_id,
-            cfg.peers.iter().map(|p| (p.id, p.addr.clone())).collect(),
-            recv,
-            send.clone(),
-        )?;
+        let peers: HashMap<_, _> = cfg.peers.iter().map(|p| (p.id, p.addr.clone())).collect();
+        let mut sm = StateMachine::new(cfg.peer_id, peers.clone(), recv, send.clone())?;
         tokio::spawn(async move { sm.run().await });
 
-        info!(peer_id = cfg.peer_id, "staring peer");
+        info!(
+            peer_id = cfg.peer_id,
+            addr = peers.get(&cfg.peer_id),
+            "staring peer"
+        );
 
         Ok(SraftNode { actions: send })
     }
 
     async fn get(&self, key: String) -> Result<Option<Vec<u8>>> {
-        let (send, recv) = oneshot::channel();
-        let msg = Message::Get {
-            key: key,
-            resp: send,
-        };
+        let (tx, rx) = oneshot::channel();
+        let msg = Message::Get { key, resp: tx };
         let _ = self.actions.send(msg).await;
-        recv.await?
+        rx.await?
     }
 
     async fn set(&self, key: String, value: Vec<u8>) -> Result<Option<Vec<u8>>> {
-        let (send, recv) = oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let msg = Message::Set {
-            key: key,
-            value: value,
-            resp: send,
+            key,
+            value,
+            resp: tx,
         };
         let _ = self.actions.send(msg).await;
-        recv.await?
+        rx.await?
+    }
+
+    async fn request_vote(
+        &self,
+        req: grpc::RequestVoteRequest,
+    ) -> Result<grpc::RequestVoteResponse> {
+        let (tx, rx) = oneshot::channel();
+        let msg = Message::RequestVote { req, resp: tx };
+        let _ = self.actions.send(msg).await;
+        rx.await?
+    }
+
+    async fn append_entries(
+        &self,
+        req: grpc::AppendEntriesRequest,
+    ) -> Result<grpc::AppendEntriesResponse> {
+        let (tx, rx) = oneshot::channel();
+        let msg = Message::AppendEntries { req, resp: tx };
+        let _ = self.actions.send(msg).await;
+        rx.await?
     }
 }

@@ -1,5 +1,5 @@
-peer_id = 0
-port = 50051
+peer_id = 2
+port = 50053
 [[peers]]
   id = 0
   addr = "http://[::1]:50051"
