@@ -35,14 +35,7 @@ impl Sraft for super::SraftNode {
     ) -> Result<Response<RequestVoteResponse>, Status> {
         let req = req.into_inner();
         match self.request_vote(req.clone()).await {
-            Ok(resp) => {
-                info!(
-                    candidate = req.candidate_id,
-                    voted = resp.vote_granted,
-                    "voted"
-                );
-                Ok(Response::new(resp))
-            }
+            Ok(resp) => Ok(Response::new(resp)),
             Err(err) => {
                 error!(
                     candidate_id = req.candidate_id,

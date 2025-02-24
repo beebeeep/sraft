@@ -148,13 +148,13 @@ impl StateMachine {
                         todo!();
                     }
                     Message::RequestVote { req, resp } => {
-                        let _ = resp.send(self.vote(&req)); // NB: not clear what shall we do here?
+                        let _ = resp.send(self.request_vote(req)); // NB: not clear what shall we do here?
                     },
                     Message::ReceiveVote(_) => {
                         // don't care as leader
                     },
                     Message::AppendEntries{req, resp } => {
-                        let _ = resp.send(self.append_entries(&req));
+                        let _ = resp.send(self.append_entries(req));
                     },
                     Message::AppendEntriesResponse{peer_id, response} => {
                         info!(
@@ -184,13 +184,13 @@ impl StateMachine {
                         let _ = resp.send(Err(anyhow!("i'm follower")));
                     }
                     Message::RequestVote { req, resp } => {
-                        let _ = resp.send(self.vote(&req));
+                        let _ = resp.send(self.request_vote(req));
                     },
                     Message::ReceiveVote(_) => {
                         // don't care as follower
                     },
                     Message::AppendEntries{req, resp } => {
-                        let _ = resp.send(self.append_entries(&req));
+                        let _ = resp.send(self.append_entries(req));
                     },
                     Message::AppendEntriesResponse{response: _, peer_id: _} => {
                         // don't care as follower
@@ -214,7 +214,7 @@ impl StateMachine {
                         let _ = resp.send(Err(anyhow!("election time")));
                     }
                     Message::RequestVote { req, resp } => {
-                        let _ = resp.send(self.vote(&req));
+                        let _ = resp.send(self.request_vote(req));
                     },
                     Message::AppendEntries{req, resp } => {
                         if req.term >= self.current_term {
@@ -222,18 +222,18 @@ impl StateMachine {
                             self.set_term(req.term);
                             self.convert_to_follower();
                         }
-                        let _ = resp.send(self.append_entries(&req));
+                        let _ = resp.send(self.append_entries(req));
                     },
                     Message::AppendEntriesResponse{response: _, peer_id: _} => {
                         // don't care as candidate
                     }
                     Message::ReceiveVote(vote) => {
+                        info!(peer = %self, votes_received = self.votes_received, vote_granted = vote.vote_granted, "vote result");
                         if vote.term > self.current_term {
                             // we are stale
                             self.set_term(vote.term);
                             self.convert_to_follower()
                         } else if vote.term == self.current_term && vote.vote_granted {
-                            info!(votes_received = self.votes_received, "got vote");
                             self.votes_received += 1;
                             if self.votes_received >= self.quorum {
                                 self.convert_to_leader();
@@ -247,7 +247,7 @@ impl StateMachine {
 
     fn append_entries(
         &mut self,
-        req: &grpc::AppendEntriesRequest,
+        req: grpc::AppendEntriesRequest,
     ) -> Result<grpc::AppendEntriesResponse> {
         if req.term < self.current_term {
             // stale leader, reject RPC
@@ -258,19 +258,56 @@ impl StateMachine {
         }
         self.election_timeout = Self::next_election_timeout();
 
-        // TODO: handle properly
+        let prev_log_index = req.prev_log_index as usize;
+
+        if prev_log_index == 0 {
+            // special case: we just bootstraped the cluster and log is empty
+            debug_assert!(self.log.is_empty());
+            self.log.extend(req.entries.into_iter().map(|e| LogEntry {
+                term: req.term,
+                entry: e,
+            }));
+            if req.leader_commit as usize > self.commit_idx {
+                self.commit_idx = usize::min(req.leader_commit as usize, self.last_log_index());
+            }
+            return Ok(grpc::AppendEntriesResponse {
+                term: self.current_term,
+                success: true,
+            });
+        }
+
+        if prev_log_index > self.log.len() {
+            // we lack log entries that leader thinks we should have, reject request so leader can send us earlier logs
+            return Ok(grpc::AppendEntriesResponse {
+                term: self.current_term,
+                success: false,
+            });
+        }
+
+        if self.log[prev_log_index - 1].term != req.prev_log_term {
+            // logs on follower and leader are out of sync, truncate them and reject request
+            self.log.truncate(prev_log_index - 1);
+            return Ok(grpc::AppendEntriesResponse {
+                term: self.current_term,
+                success: false,
+            });
+        }
+
+        self.log.extend(req.entries.into_iter().map(|e| LogEntry {
+            term: req.term,
+            entry: e,
+        }));
+        if req.leader_commit as usize > self.commit_idx {
+            self.commit_idx = usize::min(req.leader_commit as usize, self.last_log_index());
+        }
+
         Ok(grpc::AppendEntriesResponse {
             term: self.current_term,
             success: true,
         })
     }
 
-    fn set_term(&mut self, term: u64) {
-        self.current_term = term;
-        self.voted_for = None;
-    }
-
-    fn vote(&mut self, req: &grpc::RequestVoteRequest) -> Result<grpc::RequestVoteResponse> {
+    fn request_vote(&mut self, req: grpc::RequestVoteRequest) -> Result<grpc::RequestVoteResponse> {
         if req.term < self.current_term {
             // candidate is stale
             return Ok(grpc::RequestVoteResponse {
@@ -301,6 +338,11 @@ impl StateMachine {
         })
     }
 
+    fn set_term(&mut self, term: u64) {
+        self.current_term = term;
+        self.voted_for = None;
+    }
+
     fn convert_to_candidate(&mut self) {
         info!(peer = %self, "converting to candidate");
         self.state = ServerState::Candidate;
@@ -308,13 +350,15 @@ impl StateMachine {
         self.voted_for = Some(self.id);
         self.votes_received = 1;
         self.election_timeout = Self::next_election_timeout();
+        self.next_idx.clear();
+        self.match_idx.clear();
 
         // request votes from all peers in parallel
         for (id, client) in self.peers.iter() {
             if self.id == *id {
                 continue;
             }
-            task::spawn(Self::request_vote(
+            task::spawn(Self::request_vote_from_peer(
                 client.clone(),
                 *id,
                 self.tx_msgs.clone(),
@@ -329,6 +373,8 @@ impl StateMachine {
     fn convert_to_follower(&mut self) {
         info!(peer = %self, "converting to follower");
         self.state = ServerState::Follower;
+        self.next_idx.clear();
+        self.match_idx.clear();
     }
 
     fn convert_to_leader(&mut self) {
@@ -351,7 +397,7 @@ impl StateMachine {
         self.log.last().map_or(0, |e| e.term)
     }
 
-    async fn request_vote(
+    async fn request_vote_from_peer(
         mut client: SraftClient<Channel>,
         peer_id: PeerID,
         msgs: mpsc::Sender<Message>,
@@ -395,11 +441,12 @@ impl StateMachine {
             let mut client = client.clone();
             let _self = format!("{self}");
             let follower = *id;
+            let prev_log_idx = self.next_idx.get(&follower).unwrap() - 1;
             let req = grpc::AppendEntriesRequest {
                 term: self.current_term,
                 leader_id: self.id,
-                prev_log_index: self.last_log_index() as u64,
-                prev_log_term: self.last_log_term(),
+                prev_log_index: prev_log_idx as u64,
+                prev_log_term: self.log.get(prev_log_idx).map_or(0, |e| e.term),
                 entries: entries.to_vec(),
                 leader_commit: self.commit_idx as u64,
             };
