@@ -1,13 +1,10 @@
-use std::fmt;
-
 use clap::Parser;
 use sraft::{
     config,
     sraft::{api::grpc::sraft_server::SraftServer, SraftNode},
 };
 use tonic::transport::Server;
-use tracing::{span, Level};
-use tracing_subscriber::{layer::SubscriberExt, Layer};
+use tracing_subscriber::layer::SubscriberExt;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -22,7 +19,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscriber = tracing_subscriber::registry()
         .with(layer)
         .with(tracing_subscriber::EnvFilter::from_default_env());
-    // // // let subscriber = tracing_subscriber::FmtSubscriber::new();
     tracing::subscriber::set_global_default(subscriber)?;
 
     let args = Args::parse();

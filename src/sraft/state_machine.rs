@@ -3,7 +3,6 @@ use std::fmt::Display;
 use std::time::Duration;
 
 use super::api::grpc::{self, sraft_client::SraftClient};
-use super::api::grpc::{AppendEntriesRequest, RequestVoteResponse};
 use anyhow::{anyhow, Result};
 use rand::rng;
 use rand::Rng;
@@ -14,8 +13,7 @@ use tokio::task;
 use tokio::time;
 use tokio::time::Instant;
 use tonic::transport::Channel;
-use tracing::{error, span};
-use tracing::{info, Level};
+use tracing::{error, info};
 
 type PeerID = u32;
 
@@ -46,17 +44,12 @@ pub enum Message {
     },
 
     // messages from internal async jobs
-    ReceiveVote(Vote),
+    ReceiveVote(grpc::RequestVoteResponse),
 }
 
 struct LogEntry {
     entry: grpc::LogEntry,
     term: u64,
-}
-
-struct Vote {
-    term: u64,
-    granted: bool,
 }
 
 pub struct StateMachine {
@@ -82,8 +75,8 @@ pub struct StateMachine {
     votes_received: u32,
 
     // volatile state on leader
-    next_idx: Vec<(PeerID, usize)>,
-    match_idx: Vec<(PeerID, usize)>,
+    next_idx: HashMap<PeerID, usize>,
+    match_idx: HashMap<PeerID, usize>,
 }
 
 impl Display for StateMachine {
@@ -117,8 +110,8 @@ impl StateMachine {
             state: ServerState::Follower,
             commit_idx: 0,
             last_applied_idx: 0,
-            next_idx: Vec::new(),
-            match_idx: Vec::new(),
+            next_idx: HashMap::new(),
+            match_idx: HashMap::new(),
         })
     }
 
@@ -195,7 +188,7 @@ impl StateMachine {
                             // we are stale
                             self.set_term(vote.term);
                             self.convert_to_follower()
-                        } else if vote.term == self.current_term && vote.granted {
+                        } else if vote.term == self.current_term && vote.vote_granted {
                             info!(votes_received = self.votes_received, "got vote");
                             self.votes_received += 1;
                             if self.votes_received >= self.quorum {
@@ -277,7 +270,7 @@ impl StateMachine {
                 self.tx_msgs.clone(),
                 self.current_term,
                 self.id,
-                self.log.len(),
+                self.last_log_index(),
                 self.log.last().map_or(0, |e| e.term),
             ));
         }
@@ -285,10 +278,22 @@ impl StateMachine {
 
     fn convert_to_follower(&mut self) {
         info!(peer = %self, "converting to follower");
+        self.state = ServerState::Follower;
     }
 
     fn convert_to_leader(&mut self) {
         info!(peer = %self, "converting to leader");
+        self.state = ServerState::Leader;
+        self.next_idx.clear();
+        self.match_idx.clear();
+        for (peer, _) in self.peers.iter() {
+            self.next_idx.insert(*peer, self.last_log_index() + 1);
+            self.match_idx.insert(*peer, 0);
+        }
+    }
+
+    fn last_log_index(&self) -> usize {
+        self.log.len() //   just to remind that we count indexes from 1
     }
 
     async fn request_vote(
@@ -309,9 +314,9 @@ impl StateMachine {
         match client.request_vote(req).await {
             Ok(repl) => {
                 let repl = repl.into_inner();
-                let msg = Message::ReceiveVote(Vote {
+                let msg = Message::ReceiveVote(grpc::RequestVoteResponse {
                     term: repl.term,
-                    granted: repl.vote_granted,
+                    vote_granted: repl.vote_granted,
                 });
                 let _ = msgs.send(msg).await;
             }
@@ -320,7 +325,7 @@ impl StateMachine {
                     candidate = candidate_id,
                     peer_id = peer_id,
                     error = format!("{err:#}"),
-                    "requesting vote",
+                    "requesting vote from peer",
                 );
             }
         }
@@ -341,7 +346,7 @@ impl StateMachine {
             self.data.insert(entry.key, entry.value);
             return true;
         }
-        return false;
+        false
     }
 
     fn connect_to_peers(

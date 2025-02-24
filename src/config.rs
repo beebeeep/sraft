@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::Deserialize;
-use std::{collections::HashMap, fs};
+use std::fs;
 
 #[derive(Deserialize)]
 pub struct PeerCfg {
