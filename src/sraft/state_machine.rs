@@ -15,6 +15,8 @@ use tokio::time::Instant;
 use tonic::transport::Channel;
 use tracing::{error, info};
 
+const IDLE_TIMEOUT: Duration = Duration::from_millis(500);
+
 type PeerID = u32;
 
 pub enum ServerState {
@@ -45,6 +47,10 @@ pub enum Message {
 
     // messages from internal async jobs
     ReceiveVote(grpc::RequestVoteResponse),
+    AppendEntriesResponse {
+        peer_id: PeerID,
+        response: grpc::AppendEntriesResponse,
+    },
 }
 
 struct LogEntry {
@@ -129,7 +135,39 @@ impl StateMachine {
     }
 
     async fn run_leader(&mut self) {
-        todo!()
+        select! {
+            _ = time::sleep(IDLE_TIMEOUT) => {
+                self.send_entries(&[]);
+            },
+            Some(msg) = self.rx_msgs.recv() => {
+                match msg {
+                    Message::Get { key, resp } => {
+                        let _ = resp.send(self.get_data(&key));
+                    }
+                    Message::Set { key: _, value: _, resp } => {
+                        todo!();
+                    }
+                    Message::RequestVote { req, resp } => {
+                        let _ = resp.send(self.vote(&req)); // NB: not clear what shall we do here?
+                    },
+                    Message::ReceiveVote(_) => {
+                        // don't care as leader
+                    },
+                    Message::AppendEntries{req, resp } => {
+                        let _ = resp.send(self.append_entries(&req));
+                    },
+                    Message::AppendEntriesResponse{peer_id, response} => {
+                        info!(
+                            peer = %self,
+                            follower = peer_id,
+                            success = response.success,
+                            "AppendEntries response"
+                        );
+                        // TODO: handle this properly
+                    }
+                }
+            }
+        }
     }
 
     async fn run_follower(&mut self) {
@@ -154,6 +192,9 @@ impl StateMachine {
                     Message::AppendEntries{req, resp } => {
                         let _ = resp.send(self.append_entries(&req));
                     },
+                    Message::AppendEntriesResponse{response: _, peer_id: _} => {
+                        // don't care as follower
+                    }
                 }
             }
         }
@@ -183,6 +224,9 @@ impl StateMachine {
                         }
                         let _ = resp.send(self.append_entries(&req));
                     },
+                    Message::AppendEntriesResponse{response: _, peer_id: _} => {
+                        // don't care as candidate
+                    }
                     Message::ReceiveVote(vote) => {
                         if vote.term > self.current_term {
                             // we are stale
@@ -212,7 +256,13 @@ impl StateMachine {
                 success: false,
             });
         }
-        todo!()
+        self.election_timeout = Self::next_election_timeout();
+
+        // TODO: handle properly
+        Ok(grpc::AppendEntriesResponse {
+            term: self.current_term,
+            success: true,
+        })
     }
 
     fn set_term(&mut self, term: u64) {
@@ -235,7 +285,7 @@ impl StateMachine {
         }
 
         if self.voted_for.map_or(true, |v| v == req.candidate_id)
-            && self.log.last().map_or(0, |e| e.term) <= req.last_log_term
+            && self.last_log_term() <= req.last_log_term
         {
             // if we haven't voted or or already voted for that candidate, vote for candidate
             // if it's log is at least up-to-date as ours
@@ -271,7 +321,7 @@ impl StateMachine {
                 self.current_term,
                 self.id,
                 self.last_log_index(),
-                self.log.last().map_or(0, |e| e.term),
+                self.last_log_term(),
             ));
         }
     }
@@ -290,10 +340,15 @@ impl StateMachine {
             self.next_idx.insert(*peer, self.last_log_index() + 1);
             self.match_idx.insert(*peer, 0);
         }
+        self.send_entries(&[]);
     }
 
     fn last_log_index(&self) -> usize {
         self.log.len() //   just to remind that we count indexes from 1
+    }
+
+    fn last_log_term(&self) -> u64 {
+        self.log.last().map_or(0, |e| e.term)
     }
 
     async fn request_vote(
@@ -324,10 +379,51 @@ impl StateMachine {
                 error!(
                     candidate = candidate_id,
                     peer_id = peer_id,
-                    error = format!("{err:#}"),
+                    error = %err,
                     "requesting vote from peer",
                 );
             }
+        }
+    }
+
+    fn send_entries(&self, entries: &[grpc::LogEntry]) {
+        for (id, client) in self.peers.iter() {
+            if self.id == *id {
+                continue;
+            }
+            let msgs = self.tx_msgs.clone();
+            let mut client = client.clone();
+            let _self = format!("{self}");
+            let follower = *id;
+            let req = grpc::AppendEntriesRequest {
+                term: self.current_term,
+                leader_id: self.id,
+                prev_log_index: self.last_log_index() as u64,
+                prev_log_term: self.last_log_term(),
+                entries: entries.to_vec(),
+                leader_commit: self.commit_idx as u64,
+            };
+            task::spawn(async move {
+                match client.append_entries(req).await {
+                    Ok(resp) => {
+                        let _ = msgs
+                            .send(Message::AppendEntriesResponse {
+                                peer_id: follower,
+                                response: resp.into_inner(),
+                            })
+                            .await;
+                    }
+                    Err(err) => {
+                        // retries are supposed to be part of raft logic itself
+                        error!(
+                            peer = _self,
+                            follower = follower,
+                            error = %err,
+                            "sending AppendEntries"
+                        );
+                    }
+                }
+            });
         }
     }
 
