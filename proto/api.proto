@@ -38,6 +38,11 @@ message RequestVoteResponse {
 }
 
 message LogEntry {
+    uint64 term = 1;
+    Command command = 2;
+}
+
+message Command {
     string key = 1;
     bytes value = 2;
 }

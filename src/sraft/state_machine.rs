@@ -13,6 +13,7 @@ use tokio::task;
 use tokio::time;
 use tokio::time::Instant;
 use tonic::transport::Channel;
+use tracing::warn;
 use tracing::{error, info};
 
 const IDLE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -53,11 +54,6 @@ pub enum Message {
     },
 }
 
-struct LogEntry {
-    entry: grpc::LogEntry,
-    term: u64,
-}
-
 pub struct StateMachine {
     id: PeerID,
     rx_msgs: mpsc::Receiver<Message>,
@@ -70,7 +66,7 @@ pub struct StateMachine {
     // persistent state
     current_term: u64,
     voted_for: Option<PeerID>,
-    log: Vec<LogEntry>,
+    log: Vec<grpc::LogEntry>,
 
     // volatile state
     state: ServerState,
@@ -151,10 +147,16 @@ impl StateMachine {
                         let _ = resp.send(self.request_vote(req)); // NB: not clear what shall we do here?
                     },
                     Message::ReceiveVote(_) => {
-                        // don't care as leader
+                        // don't care as we are leader already
                     },
                     Message::AppendEntries{req, resp } => {
-                        let _ = resp.send(self.append_entries(req));
+                        if req.term > self.current_term {
+                            info!(peer = %self, new_leader_id = req.leader_id, new_leader_term = req.term, "found new leader with greated term, converting to follower");
+                            self.convert_to_follower();
+                            let _ = resp.send(self.append_entries(req));
+                        } else {
+                            info!(peer = %self, offender_id = req.leader_id, offender_term = req.term, "found unexpected leader");
+                        }
                     },
                     Message::AppendEntriesResponse{peer_id, response} => {
                         info!(
@@ -190,6 +192,9 @@ impl StateMachine {
                         // don't care as follower
                     },
                     Message::AppendEntries{req, resp } => {
+                        if req.term > self.current_term {
+                            self.set_term(req.term);
+                        }
                         let _ = resp.send(self.append_entries(req));
                     },
                     Message::AppendEntriesResponse{response: _, peer_id: _} => {
@@ -217,7 +222,7 @@ impl StateMachine {
                         let _ = resp.send(self.request_vote(req));
                     },
                     Message::AppendEntries{req, resp } => {
-                        if req.term >= self.current_term {
+                        if req.term > self.current_term {
                             // leader was elected and already send AppendEntries
                             self.set_term(req.term);
                             self.convert_to_follower();
@@ -263,10 +268,7 @@ impl StateMachine {
         if prev_log_index == 0 {
             // special case: we just bootstraped the cluster and log is empty
             debug_assert!(self.log.is_empty());
-            self.log.extend(req.entries.into_iter().map(|e| LogEntry {
-                term: req.term,
-                entry: e,
-            }));
+            self.log.extend(req.entries);
             if req.leader_commit as usize > self.commit_idx {
                 self.commit_idx = usize::min(req.leader_commit as usize, self.last_log_index());
             }
@@ -276,27 +278,28 @@ impl StateMachine {
             });
         }
 
-        if prev_log_index > self.log.len() {
-            // we lack log entries that leader thinks we should have, reject request so leader can send us earlier logs
+        if prev_log_index > self.log.len() || self.log[prev_log_index - 1].term != req.prev_log_term
+        {
+            // we don't have matching log entry at prev_log_index
             return Ok(grpc::AppendEntriesResponse {
                 term: self.current_term,
                 success: false,
             });
         }
 
-        if self.log[prev_log_index - 1].term != req.prev_log_term {
-            // logs on follower and leader are out of sync, truncate them and reject request
-            self.log.truncate(prev_log_index - 1);
-            return Ok(grpc::AppendEntriesResponse {
-                term: self.current_term,
-                success: false,
-            });
+        for (i, entry) in req.entries.into_iter().enumerate() {
+            if let Some(e) = self.log.get(prev_log_index + i) {
+                if e.term == entry.term {
+                    // this entry match, skipping
+                    continue;
+                } else {
+                    // conflicting entry, truncate it and all that follow
+                    self.log.truncate(prev_log_index + i);
+                }
+            }
+            self.log.push(entry);
         }
 
-        self.log.extend(req.entries.into_iter().map(|e| LogEntry {
-            term: req.term,
-            entry: e,
-        }));
         if req.leader_commit as usize > self.commit_idx {
             self.commit_idx = usize::min(req.leader_commit as usize, self.last_log_index());
         }
@@ -485,8 +488,8 @@ impl StateMachine {
                 self.last_applied_idx < self.log.len(),
                 "last_applied_idx >= log length"
             );
-            let entry = self.log[self.last_applied_idx].entry.clone();
-            self.data.insert(entry.key, entry.value);
+            let cmd = self.log[self.last_applied_idx].command.clone().unwrap();
+            self.data.insert(cmd.key, cmd.value);
             return true;
         }
         false
@@ -508,5 +511,59 @@ impl StateMachine {
         Instant::now()
             .checked_add(Duration::from_millis(rng().random_range(1000..1200)))
             .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_append_entries() {
+        let (tx, rx) = mpsc::channel(1);
+        let mut sm = StateMachine::new(0, HashMap::new(), rx, tx).unwrap();
+        sm.set_term(2);
+        let mut req = grpc::AppendEntriesRequest {
+            term: 1,
+            leader_id: 0,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: Vec::new(),
+            leader_commit: 0,
+        };
+
+        // stale term
+        let mut resp = sm.append_entries(req.clone()).unwrap();
+        assert!(!resp.success);
+
+        // ok term, no entries
+        req.term = 2;
+        resp = sm.append_entries(req.clone()).unwrap();
+        assert!(resp.success);
+        assert!(sm.log.is_empty());
+
+        // insert entry
+        req.leader_commit = 1;
+        req.entries.push(grpc::LogEntry {
+            term: 2,
+            command: Some(grpc::Command {
+                key: "foo".to_string(),
+                value: "chlos".into(),
+            }),
+        });
+        resp = sm.append_entries(req.clone()).unwrap();
+        assert!(resp.success);
+        assert_eq!(sm.log.len(), 1);
+        assert_eq!(sm.log[0].command.as_ref().unwrap().key, "foo");
+        assert_eq!(sm.commit_idx, 1);
+
+        // another entry
+        req.prev_log_index = 1;
+        req.prev_log_term = 2;
+        resp = sm.append_entries(req.clone()).unwrap();
+        assert!(resp.success);
+        assert_eq!(sm.log.len(), 2);
+
+        // TODO: overwrite conflicting entries
     }
 }
