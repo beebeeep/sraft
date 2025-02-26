@@ -13,12 +13,13 @@ use tokio::task;
 use tokio::time;
 use tokio::time::Instant;
 use tonic::transport::Channel;
-use tracing::warn;
+use tracing::debug;
 use tracing::{error, info};
 
 const IDLE_TIMEOUT: Duration = Duration::from_millis(500);
 
 type PeerID = u32;
+type EntryIdx = usize; // log entry index, STARTS FROM 1
 
 pub enum ServerState {
     Leader,
@@ -50,6 +51,7 @@ pub enum Message {
     ReceiveVote(grpc::RequestVoteResponse),
     AppendEntriesResponse {
         peer_id: PeerID,
+        entries_count: usize,
         response: grpc::AppendEntriesResponse,
     },
 }
@@ -62,6 +64,7 @@ pub struct StateMachine {
     peers: HashMap<PeerID, SraftClient<Channel>>,
     quorum: u32,
     election_timeout: Instant,
+    pending_transactions: HashMap<EntryIdx, oneshot::Sender<Option<Vec<u8>>>>,
 
     // persistent state
     current_term: u64,
@@ -70,15 +73,15 @@ pub struct StateMachine {
 
     // volatile state
     state: ServerState,
-    commit_idx: usize,
-    last_applied_idx: usize,
+    commit_idx: EntryIdx,
+    last_applied_idx: EntryIdx,
 
     // volatile state on candidate
     votes_received: u32,
 
     // volatile state on leader
-    next_idx: HashMap<PeerID, usize>,
-    match_idx: HashMap<PeerID, usize>,
+    next_idx: HashMap<PeerID, EntryIdx>,
+    match_idx: HashMap<PeerID, EntryIdx>,
 }
 
 impl Display for StateMachine {
@@ -102,6 +105,7 @@ impl StateMachine {
             quorum: (peers.len() / 2 + 1) as u32,
             peers: Self::connect_to_peers(peers)?,
             election_timeout: Self::next_election_timeout(),
+            pending_transactions: HashMap::new(),
 
             current_term: 0,
             voted_for: None,
@@ -131,17 +135,20 @@ impl StateMachine {
     }
 
     async fn run_leader(&mut self) {
+        self.maybe_update_followers();
+        self.maybe_update_commit_idx();
+
         select! {
             _ = time::sleep(IDLE_TIMEOUT) => {
-                self.send_entries(&[]);
+                self.send_heartbeat();
             },
             Some(msg) = self.rx_msgs.recv() => {
                 match msg {
                     Message::Get { key, resp } => {
                         let _ = resp.send(self.get_data(&key));
                     }
-                    Message::Set { key: _, value: _, resp } => {
-                        todo!();
+                    Message::Set { key, value, resp } => {
+                        self.set_data(&key, value, resp);
                     }
                     Message::RequestVote { req, resp } => {
                         let _ = resp.send(self.request_vote(req)); // NB: not clear what shall we do here?
@@ -158,14 +165,21 @@ impl StateMachine {
                             info!(peer = %self, offender_id = req.leader_id, offender_term = req.term, "found unexpected leader");
                         }
                     },
-                    Message::AppendEntriesResponse{peer_id, response} => {
+                    Message::AppendEntriesResponse{peer_id, entries_count, response} => {
                         info!(
                             peer = %self,
                             follower = peer_id,
                             success = response.success,
                             "AppendEntries response"
                         );
-                        // TODO: handle this properly
+                        if response.success {
+                            let next_idx  = self.next_idx.get_mut(&peer_id).unwrap();
+                            *self.match_idx.get_mut(&peer_id).unwrap() = *next_idx;
+                            *next_idx += entries_count;
+                        } else {
+                            // follower failed AppendEntries, will retry with earlier log entries
+                            *self.next_idx.get_mut(&peer_id).unwrap() -= 1;
+                        }
                     }
                 }
             }
@@ -183,7 +197,7 @@ impl StateMachine {
                         let _ = resp.send(self.get_data(&key));
                     }
                     Message::Set { key: _, value: _, resp } => {
-                        let _ = resp.send(Err(anyhow!("i'm follower")));
+                        let _ = resp.send(Err(anyhow!("i'm follower")));    // TODO: proxy request to leader?
                     }
                     Message::RequestVote { req, resp } => {
                         let _ = resp.send(self.request_vote(req));
@@ -197,7 +211,7 @@ impl StateMachine {
                         }
                         let _ = resp.send(self.append_entries(req));
                     },
-                    Message::AppendEntriesResponse{response: _, peer_id: _} => {
+                    Message::AppendEntriesResponse{response: _, entries_count: _, peer_id: _} => {
                         // don't care as follower
                     }
                 }
@@ -229,7 +243,7 @@ impl StateMachine {
                         }
                         let _ = resp.send(self.append_entries(req));
                     },
-                    Message::AppendEntriesResponse{response: _, peer_id: _} => {
+                    Message::AppendEntriesResponse{response: _, entries_count: _, peer_id: _} => {
                         // don't care as candidate
                     }
                     Message::ReceiveVote(vote) => {
@@ -254,6 +268,7 @@ impl StateMachine {
         &mut self,
         req: grpc::AppendEntriesRequest,
     ) -> Result<grpc::AppendEntriesResponse> {
+        debug!(peer = %self, req_term = req.term, prev_log_index = req.prev_log_index, prev_log_term = req.prev_log_index, "got appendEntries");
         if req.term < self.current_term {
             // stale leader, reject RPC
             return Ok(grpc::AppendEntriesResponse {
@@ -263,13 +278,13 @@ impl StateMachine {
         }
         self.election_timeout = Self::next_election_timeout();
 
-        let prev_log_index = req.prev_log_index as usize;
+        let prev_log_index = req.prev_log_index as EntryIdx;
 
         if prev_log_index == 0 {
             // special case: we just bootstraped the cluster and log is empty
             debug_assert!(self.log.is_empty());
             self.log.extend(req.entries);
-            if req.leader_commit as usize > self.commit_idx {
+            if req.leader_commit as EntryIdx > self.commit_idx {
                 self.commit_idx = usize::min(req.leader_commit as usize, self.last_log_index());
             }
             return Ok(grpc::AppendEntriesResponse {
@@ -300,7 +315,7 @@ impl StateMachine {
             self.log.push(entry);
         }
 
-        if req.leader_commit as usize > self.commit_idx {
+        if req.leader_commit as EntryIdx > self.commit_idx {
             self.commit_idx = usize::min(req.leader_commit as usize, self.last_log_index());
         }
 
@@ -378,6 +393,7 @@ impl StateMachine {
         self.state = ServerState::Follower;
         self.next_idx.clear();
         self.match_idx.clear();
+        self.pending_transactions.clear();
     }
 
     fn convert_to_leader(&mut self) {
@@ -389,10 +405,10 @@ impl StateMachine {
             self.next_idx.insert(*peer, self.last_log_index() + 1);
             self.match_idx.insert(*peer, 0);
         }
-        self.send_entries(&[]);
+        self.send_heartbeat();
     }
 
-    fn last_log_index(&self) -> usize {
+    fn last_log_index(&self) -> EntryIdx {
         self.log.len() //   just to remind that we count indexes from 1
     }
 
@@ -406,7 +422,7 @@ impl StateMachine {
         msgs: mpsc::Sender<Message>,
         term: u64,
         candidate_id: PeerID,
-        last_log_index: usize,
+        last_log_index: EntryIdx,
         last_log_term: u64,
     ) {
         let req = grpc::RequestVoteRequest {
@@ -435,64 +451,140 @@ impl StateMachine {
         }
     }
 
-    fn send_entries(&self, entries: &[grpc::LogEntry]) {
-        for (id, client) in self.peers.iter() {
-            if self.id == *id {
+    fn send_heartbeat(&self) {
+        for peer in self.peers.keys() {
+            if self.id == *peer {
                 continue;
             }
-            let msgs = self.tx_msgs.clone();
-            let mut client = client.clone();
-            let _self = format!("{self}");
-            let follower = *id;
-            let prev_log_idx = self.next_idx.get(&follower).unwrap() - 1;
-            let req = grpc::AppendEntriesRequest {
-                term: self.current_term,
-                leader_id: self.id,
-                prev_log_index: prev_log_idx as u64,
-                prev_log_term: self.log.get(prev_log_idx).map_or(0, |e| e.term),
-                entries: entries.to_vec(),
-                leader_commit: self.commit_idx as u64,
-            };
-            task::spawn(async move {
-                match client.append_entries(req).await {
-                    Ok(resp) => {
-                        let _ = msgs
-                            .send(Message::AppendEntriesResponse {
-                                peer_id: follower,
-                                response: resp.into_inner(),
-                            })
-                            .await;
-                    }
-                    Err(err) => {
-                        // retries are supposed to be part of raft logic itself
-                        error!(
-                            peer = _self,
-                            follower = follower,
-                            error = %err,
-                            "sending AppendEntries"
-                        );
-                    }
-                }
-            });
+            self.send_entries(peer, &[]);
         }
+    }
+
+    fn send_entries(&self, peer: &PeerID, entries: &[grpc::LogEntry]) {
+        let client = self.peers.get(peer).unwrap();
+        let msgs = self.tx_msgs.clone();
+        let mut client = client.clone();
+        let _self = format!("{self}");
+        let follower = *peer;
+        let prev_log_idx = self.next_idx.get(&follower).unwrap() - 1;
+        let entries_count = entries.len();
+        let req = grpc::AppendEntriesRequest {
+            term: self.current_term,
+            leader_id: self.id,
+            prev_log_index: prev_log_idx as u64,
+            prev_log_term: self.log.get(prev_log_idx).map_or(0, |e| e.term),
+            entries: entries.to_vec(),
+            leader_commit: self.commit_idx as u64,
+        };
+        task::spawn(async move {
+            match client.append_entries(req).await {
+                Ok(resp) => {
+                    let _ = msgs
+                        .send(Message::AppendEntriesResponse {
+                            peer_id: follower,
+                            entries_count,
+                            response: resp.into_inner(),
+                        })
+                        .await;
+                }
+                Err(err) => {
+                    // retries are supposed to be part of raft logic itself
+                    error!(
+                        peer = _self,
+                        follower = follower,
+                        error = %err,
+                        "sending AppendEntries"
+                    );
+                }
+            }
+        });
     }
 
     fn get_data(&self, key: &str) -> Result<Option<Vec<u8>>> {
         Ok(self.data.get(key).cloned()) // TODO: storage can be shared with grpc layer probably?
     }
 
+    fn set_data(
+        &mut self,
+        key: &str,
+        value: Vec<u8>,
+        resp: oneshot::Sender<Result<Option<Vec<u8>>>>,
+    ) {
+        self.log.push(grpc::LogEntry {
+            term: self.current_term,
+            command: Some(grpc::Command {
+                key: key.to_string(),
+                value,
+            }),
+        });
+
+        // the transaction was inserted to log and will be sent to all followers in next iteration of leader loop
+        // following future will wait for it to be commited and will respond to client
+        let (tx, mut rx) = oneshot::channel();
+        self.pending_transactions.insert(self.last_log_index(), tx);
+        tokio::spawn(async move {
+            select! {
+                // TODO: process client disconnects via cancellation tokens,
+                // otherwise we will be leaking memory in self.pending_transactions
+                tx_result = &mut rx => {
+                    match tx_result {
+                        Ok(prev_value) => {
+                            let _ = resp.send(Ok(prev_value));
+                        }
+                        Err(err) => {
+                            error!(err = %err, "write error");
+                            let _ = resp.send(Err(err.into()));
+                        }
+                    }
+
+                },
+            }
+        });
+    }
+
     fn maybe_apply_log(&mut self) -> bool {
-        if self.commit_idx > self.last_applied_idx {
-            self.last_applied_idx += 1;
-            debug_assert!(
-                self.last_applied_idx < self.log.len(),
-                "last_applied_idx >= log length"
-            );
-            let cmd = self.log[self.last_applied_idx].command.clone().unwrap();
-            self.data.insert(cmd.key, cmd.value);
-            return true;
+        if self.commit_idx <= self.last_applied_idx {
+            return false;
         }
-        false
+        self.last_applied_idx += 1;
+        debug_assert!(
+            self.last_applied_idx <= self.log.len(),
+            "(applying log entries) last_applied_idx > log length"
+        );
+        let cmd = self.log[self.last_applied_idx - 1].command.clone().unwrap();
+        let old_value = self.data.insert(cmd.key, cmd.value);
+        if let Some(chan) = self.pending_transactions.remove(&self.last_applied_idx) {
+            let _ = chan.send(old_value);
+        }
+        true
+    }
+
+    fn maybe_update_followers(&self) {
+        let last_log_idx = self.last_log_index();
+        for (follower, idx) in self.next_idx.iter() {
+            if *idx < last_log_idx {
+                self.send_entries(follower, &self.log[*idx..]);
+            }
+        }
+    }
+
+    fn maybe_update_commit_idx(&mut self) {
+        debug_assert!(
+            self.commit_idx <= self.last_log_index(),
+            "(updaring commitIndex) commitIndex <= log len"
+        );
+        if self.commit_idx == self.last_log_index() {
+            return;
+        }
+        let mut i = self.last_log_index();
+        while i > self.commit_idx {
+            if self.match_idx.iter().filter(|(_, m)| **m >= i).count() >= self.quorum as usize
+                && self.log[i - 1].term == self.current_term
+            {
+                self.commit_idx = i;
+            }
+            i -= 1;
+        }
     }
 
     fn connect_to_peers(
@@ -558,12 +650,30 @@ mod tests {
         assert_eq!(sm.commit_idx, 1);
 
         // another entry
+        req.leader_commit = 2;
         req.prev_log_index = 1;
         req.prev_log_term = 2;
         resp = sm.append_entries(req.clone()).unwrap();
         assert!(resp.success);
         assert_eq!(sm.log.len(), 2);
+        assert_eq!(sm.commit_idx, 2);
 
         // TODO: overwrite conflicting entries
+        sm.log.push(grpc::LogEntry {
+            term: 42,
+            command: Some(grpc::Command {
+                key: "wrong".to_string(),
+                value: "wrong".into(),
+            }),
+        });
+        assert_eq!(sm.log[2].command.as_ref().unwrap().key, "wrong");
+        sm.commit_idx = 3;
+        req.leader_commit = 3;
+        req.prev_log_index = 2;
+        resp = sm.append_entries(req.clone()).unwrap();
+        assert!(resp.success);
+        assert_eq!(sm.log.len(), 3);
+        assert_eq!(sm.commit_idx, 3);
+        assert_eq!(sm.log[2].command.as_ref().unwrap().key, "foo");
     }
 }
