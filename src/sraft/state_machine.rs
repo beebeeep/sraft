@@ -55,8 +55,7 @@ pub enum Message {
     ReceiveVote(grpc::RequestVoteResponse),
     AppendEntriesResponse {
         peer_id: PeerID,
-        entries_count: usize,
-        response: grpc::AppendEntriesResponse,
+        replicated_index: Option<EntryIdx>,
     },
 }
 
@@ -119,7 +118,7 @@ impl StateMachine {
             tx_msgs,
             data: HashMap::new(),
             quorum: (peers.len() / 2 + 1) as u32,
-            peers: Self::connect_to_peers(peers)?,
+            peers: Self::connect_to_peers(id, peers)?,
             election_timeout: Self::next_election_timeout(Some(100..200)),
             pending_transactions: HashMap::new(),
 
@@ -185,19 +184,24 @@ impl StateMachine {
                             info!(peer = %self, offender_id = req.leader_id, offender_term = req.term, "found unexpected leader");
                         }
                     },
-                    Message::AppendEntriesResponse{peer_id, entries_count, response} => {
-                        info!(
-                            peer = %self,
-                            follower = peer_id,
-                            success = response.success,
-                            "AppendEntries response"
-                        );
-                        if response.success {
+                    Message::AppendEntriesResponse{peer_id, replicated_index} => {
+                        if let Some(replicated_index) = replicated_index {
+                            debug!(
+                                peer = %self,
+                                follower = peer_id,
+                                replicated_index = replicated_index,
+                                "follower replicated entries"
+                            );
                             let next_idx  = self.next_idx.get_mut(&peer_id).unwrap();
-                            *self.match_idx.get_mut(&peer_id).unwrap() = *next_idx;
-                            *next_idx += entries_count;
+                            *next_idx = replicated_index + 1;
+                            *self.match_idx.get_mut(&peer_id).unwrap() = replicated_index;
                         } else {
                             // follower failed AppendEntries, will retry with earlier log entries
+                            debug!(
+                                peer = %self,
+                                follower = peer_id,
+                                "follower is lagging"
+                            );
                             *self.next_idx.get_mut(&peer_id).unwrap() -= 1;
                         }
                     }
@@ -231,7 +235,7 @@ impl StateMachine {
                         }
                         let _ = resp.send(self.append_entries(req));
                     },
-                    Message::AppendEntriesResponse{response: _, entries_count: _, peer_id: _} => {
+                    Message::AppendEntriesResponse{ .. } => {
                         // don't care as follower
                     }
                 }
@@ -264,7 +268,7 @@ impl StateMachine {
                         }
                         let _ = resp.send(self.append_entries(req));
                     },
-                    Message::AppendEntriesResponse{response: _, entries_count: _, peer_id: _} => {
+                    Message::AppendEntriesResponse { .. } => {
                         // don't care as candidate
                     }
                     Message::ReceiveVote(vote) => {
@@ -303,7 +307,7 @@ impl StateMachine {
         let prev_log_index = req.prev_log_index as EntryIdx;
         if prev_log_index == 0 {
             // special case: we just bootstraped the cluster and log is empty
-            debug_assert!(self.log.is_empty());
+            debug_assert!(self.log.is_empty()); // not sure about that
             self.log.extend(req.entries);
             if req.leader_commit as EntryIdx > self.commit_idx {
                 self.commit_idx = usize::min(req.leader_commit as usize, self.last_log_index());
@@ -504,8 +508,11 @@ impl StateMachine {
                     let _ = msgs
                         .send(Message::AppendEntriesResponse {
                             peer_id: follower,
-                            entries_count,
-                            response: resp.into_inner(),
+                            replicated_index: if resp.into_inner().success {
+                                Some(prev_log_idx + entries_count)
+                            } else {
+                                None
+                            },
                         })
                         .await;
                 }
@@ -564,6 +571,8 @@ impl StateMachine {
             }
             warn!("reporter done");
         });
+
+        debug!(peer = %self, index = self.last_applied_idx, "wrote new entry");
     }
 
     fn maybe_apply_log(&mut self) -> bool {
@@ -577,6 +586,12 @@ impl StateMachine {
         );
 
         debug!(peer = %self, index = self.last_applied_idx, "applying log entry");
+        for (id, idx) in self.next_idx.iter() {
+            println!(
+                "follower {id} nextIndex {idx} matchIndex {}",
+                self.match_idx.get(id).unwrap()
+            );
+        }
 
         let cmd = self.log[self.last_applied_idx - 1].command.clone().unwrap();
         let old_value = self.data.insert(cmd.key, cmd.value);
@@ -590,9 +605,9 @@ impl StateMachine {
         let last_log_idx = self.last_log_index();
         for (follower, idx) in self.next_idx.iter() {
             debug!(peer = %self, follower = follower, follower_idx = idx, "follower nextIndex");
-            if *idx < last_log_idx {
+            if last_log_idx >= *next_idx {
                 debug!(peer = %self, follower = follower, follower_next_idx = idx, "updating follower");
-                self.send_entries(follower, &self.log[*idx..]);
+                self.send_entries(follower, &self.log[*next_idx - 1..]);
             }
         }
         false
@@ -620,10 +635,14 @@ impl StateMachine {
     }
 
     fn connect_to_peers(
+        my_id: PeerID,
         addrs: HashMap<PeerID, String>,
     ) -> Result<HashMap<PeerID, SraftClient<Channel>>> {
         let mut peers = HashMap::with_capacity(addrs.len());
         for addr in addrs {
+            if addr.0 == my_id {
+                continue;
+            }
             println!("connected to {}", addr.1);
             let ch = Channel::from_shared(addr.1)?.connect_lazy();
             peers.insert(addr.0, SraftClient::new(ch));
