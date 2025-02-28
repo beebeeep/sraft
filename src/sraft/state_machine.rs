@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::ops::Range;
 use std::time::Duration;
 
 use super::api::grpc::{self, sraft_client::SraftClient};
 use anyhow::{anyhow, Result};
+use rand::distr::uniform::SampleRange;
 use rand::rng;
 use rand::Rng;
 use tokio::select;
@@ -14,9 +16,11 @@ use tokio::time;
 use tokio::time::Instant;
 use tonic::transport::Channel;
 use tracing::debug;
+use tracing::warn;
 use tracing::{error, info};
 
-const IDLE_TIMEOUT: Duration = Duration::from_millis(500);
+const IDLE_TIMEOUT: Duration = Duration::from_millis(2000);
+const ELECTION_TIMEOUT_MS: Range<u64> = 2500..3000;
 
 type PeerID = u32;
 type EntryIdx = usize; // log entry index, STARTS FROM 1
@@ -104,7 +108,7 @@ impl StateMachine {
             data: HashMap::new(),
             quorum: (peers.len() / 2 + 1) as u32,
             peers: Self::connect_to_peers(peers)?,
-            election_timeout: Self::next_election_timeout(),
+            election_timeout: Self::next_election_timeout(Some(100..200)),
             pending_transactions: HashMap::new(),
 
             current_term: 0,
@@ -166,6 +170,7 @@ impl StateMachine {
                         }
                     },
                     Message::AppendEntriesResponse{peer_id, entries_count, response} => {
+                        incorrect!!!!!!!!!
                         info!(
                             peer = %self,
                             follower = peer_id,
@@ -268,7 +273,9 @@ impl StateMachine {
         &mut self,
         req: grpc::AppendEntriesRequest,
     ) -> Result<grpc::AppendEntriesResponse> {
-        debug!(peer = %self, req_term = req.term, prev_log_index = req.prev_log_index, prev_log_term = req.prev_log_index, "got appendEntries");
+        if !req.entries.is_empty() {
+            debug!(peer = %self, req_term = req.term, prev_log_index = req.prev_log_index, prev_log_term = req.prev_log_index, "got appendEntries");
+        }
         if req.term < self.current_term {
             // stale leader, reject RPC
             return Ok(grpc::AppendEntriesResponse {
@@ -276,7 +283,7 @@ impl StateMachine {
                 success: false,
             });
         }
-        self.election_timeout = Self::next_election_timeout();
+        self.election_timeout = Self::next_election_timeout(None);
 
         let prev_log_index = req.prev_log_index as EntryIdx;
 
@@ -367,7 +374,7 @@ impl StateMachine {
         self.current_term += 1;
         self.voted_for = Some(self.id);
         self.votes_received = 1;
-        self.election_timeout = Self::next_election_timeout();
+        self.election_timeout = Self::next_election_timeout(None);
         self.next_idx.clear();
         self.match_idx.clear();
 
@@ -527,18 +534,20 @@ impl StateMachine {
                 // TODO: process client disconnects via cancellation tokens,
                 // otherwise we will be leaking memory in self.pending_transactions
                 tx_result = &mut rx => {
+                    warn!("tx_result");
                     match tx_result {
                         Ok(prev_value) => {
                             let _ = resp.send(Ok(prev_value));
                         }
                         Err(err) => {
-                            error!(err = %err, "write error");
+                            error!(err = %err, "Set() failed");
                             let _ = resp.send(Err(err.into()));
                         }
                     }
 
                 },
             }
+            warn!("reporter done");
         });
     }
 
@@ -551,6 +560,9 @@ impl StateMachine {
             self.last_applied_idx <= self.log.len(),
             "(applying log entries) last_applied_idx > log length"
         );
+
+        debug!(peer = %self, index = self.last_applied_idx, "applying log entry");
+
         let cmd = self.log[self.last_applied_idx - 1].command.clone().unwrap();
         let old_value = self.data.insert(cmd.key, cmd.value);
         if let Some(chan) = self.pending_transactions.remove(&self.last_applied_idx) {
@@ -562,7 +574,9 @@ impl StateMachine {
     fn maybe_update_followers(&self) {
         let last_log_idx = self.last_log_index();
         for (follower, idx) in self.next_idx.iter() {
+            debug!(peer = %self, follower = follower, follower_idx = idx, "follower nextIndex");
             if *idx < last_log_idx {
+                debug!(peer = %self, follower = follower, follower_next_idx = idx, "updating follower");
                 self.send_entries(follower, &self.log[*idx..]);
             }
         }
@@ -571,17 +585,18 @@ impl StateMachine {
     fn maybe_update_commit_idx(&mut self) {
         debug_assert!(
             self.commit_idx <= self.last_log_index(),
-            "(updaring commitIndex) commitIndex <= log len"
+            "(updating commitIndex) commitIndex <= log len"
         );
         if self.commit_idx == self.last_log_index() {
             return;
         }
         let mut i = self.last_log_index();
         while i > self.commit_idx {
-            if self.match_idx.iter().filter(|(_, m)| **m >= i).count() >= self.quorum as usize
-                && self.log[i - 1].term == self.current_term
-            {
+            let in_sync = self.match_idx.iter().filter(|(_, m)| **m >= i).count();
+            if in_sync >= self.quorum as usize && self.log[i - 1].term == self.current_term {
+                debug!(peer = %self, index = i, in_sync = in_sync, "got quorum on log entry");
                 self.commit_idx = i;
+                break;
             }
             i -= 1;
         }
@@ -599,9 +614,11 @@ impl StateMachine {
         Ok(peers)
     }
 
-    fn next_election_timeout() -> Instant {
+    fn next_election_timeout(r: Option<Range<u64>>) -> Instant {
         Instant::now()
-            .checked_add(Duration::from_millis(rng().random_range(1000..1200)))
+            .checked_add(Duration::from_millis(
+                rng().random_range(r.unwrap_or(ELECTION_TIMEOUT_MS)),
+            ))
             .unwrap()
     }
 }
