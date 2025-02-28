@@ -90,7 +90,19 @@ pub struct StateMachine {
 
 impl Display for StateMachine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Peer(id={}, term={})", self.id, self.current_term)
+        write!(
+            f,
+            "Peer{}(i={}, t={}, ll={}, ci={}, la={})",
+            match self.state {
+                ServerState::Leader => "*",
+                _ => "",
+            },
+            self.id,
+            self.current_term,
+            self.last_log_index(),
+            self.commit_idx,
+            self.last_applied_idx
+        )
     }
 }
 
@@ -139,8 +151,12 @@ impl StateMachine {
     }
 
     async fn run_leader(&mut self) {
-        self.maybe_update_followers();
-        self.maybe_update_commit_idx();
+        if self.maybe_update_followers() {
+            return;
+        }
+        if self.maybe_update_commit_idx() {
+            return;
+        }
 
         select! {
             _ = time::sleep(IDLE_TIMEOUT) => {
@@ -170,7 +186,6 @@ impl StateMachine {
                         }
                     },
                     Message::AppendEntriesResponse{peer_id, entries_count, response} => {
-                        incorrect!!!!!!!!!
                         info!(
                             peer = %self,
                             follower = peer_id,
@@ -244,6 +259,7 @@ impl StateMachine {
                         if req.term > self.current_term {
                             // leader was elected and already send AppendEntries
                             self.set_term(req.term);
+                            debug!(peer = %self, term = req.term, "got AppendEntries with greater term");
                             self.convert_to_follower();
                         }
                         let _ = resp.send(self.append_entries(req));
@@ -256,6 +272,7 @@ impl StateMachine {
                         if vote.term > self.current_term {
                             // we are stale
                             self.set_term(vote.term);
+                            debug!(peer = %self, term = vote.term, "got RequestVote reply with greater term");
                             self.convert_to_follower()
                         } else if vote.term == self.current_term && vote.vote_granted {
                             self.votes_received += 1;
@@ -273,9 +290,6 @@ impl StateMachine {
         &mut self,
         req: grpc::AppendEntriesRequest,
     ) -> Result<grpc::AppendEntriesResponse> {
-        if !req.entries.is_empty() {
-            debug!(peer = %self, req_term = req.term, prev_log_index = req.prev_log_index, prev_log_term = req.prev_log_index, "got appendEntries");
-        }
         if req.term < self.current_term {
             // stale leader, reject RPC
             return Ok(grpc::AppendEntriesResponse {
@@ -283,10 +297,10 @@ impl StateMachine {
                 success: false,
             });
         }
+        debug!(peer = %self, leader_commit = req.leader_commit, entries_count = req.entries.len(), "AppendEntries");
         self.election_timeout = Self::next_election_timeout(None);
 
         let prev_log_index = req.prev_log_index as EntryIdx;
-
         if prev_log_index == 0 {
             // special case: we just bootstraped the cluster and log is empty
             debug_assert!(self.log.is_empty());
@@ -343,6 +357,7 @@ impl StateMachine {
         if req.term > self.current_term {
             // candidate is more recent
             self.set_term(req.term);
+            debug!(peer = %self, term = req.term, "got RequestVote with greater term");
             self.convert_to_follower();
         }
 
@@ -571,7 +586,7 @@ impl StateMachine {
         true
     }
 
-    fn maybe_update_followers(&self) {
+    fn maybe_update_followers(&self) -> bool {
         let last_log_idx = self.last_log_index();
         for (follower, idx) in self.next_idx.iter() {
             debug!(peer = %self, follower = follower, follower_idx = idx, "follower nextIndex");
@@ -580,15 +595,16 @@ impl StateMachine {
                 self.send_entries(follower, &self.log[*idx..]);
             }
         }
+        false
     }
 
-    fn maybe_update_commit_idx(&mut self) {
+    fn maybe_update_commit_idx(&mut self) -> bool {
         debug_assert!(
             self.commit_idx <= self.last_log_index(),
             "(updating commitIndex) commitIndex <= log len"
         );
         if self.commit_idx == self.last_log_index() {
-            return;
+            return false;
         }
         let mut i = self.last_log_index();
         while i > self.commit_idx {
@@ -596,10 +612,11 @@ impl StateMachine {
             if in_sync >= self.quorum as usize && self.log[i - 1].term == self.current_term {
                 debug!(peer = %self, index = i, in_sync = in_sync, "got quorum on log entry");
                 self.commit_idx = i;
-                break;
+                return true;
             }
             i -= 1;
         }
+        false
     }
 
     fn connect_to_peers(
