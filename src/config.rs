@@ -4,7 +4,6 @@ use std::fs;
 
 #[derive(Deserialize)]
 pub struct PeerCfg {
-    pub id: u32,
     pub addr: String,
 }
 

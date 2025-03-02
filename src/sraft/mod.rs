@@ -18,13 +18,17 @@ impl SraftNode {
     pub fn new(cfg: &Config) -> Result<Self> {
         let (send, recv) = mpsc::channel(8);
 
-        let peers: HashMap<_, _> = cfg.peers.iter().map(|p| (p.id, p.addr.clone())).collect();
-        let mut sm = StateMachine::new(cfg.peer_id, peers.clone(), recv, send.clone())?;
+        let mut sm = StateMachine::new(
+            cfg.peer_id as usize,
+            cfg.peers.iter().map(|x| x.addr.clone()).collect(),
+            recv,
+            send.clone(),
+        )?;
         tokio::spawn(async move { sm.run().await });
 
         info!(
             peer_id = cfg.peer_id,
-            addr = peers.get(&cfg.peer_id),
+            addr = cfg.peers[cfg.peer_id as usize].addr,
             "staring peer"
         );
 
