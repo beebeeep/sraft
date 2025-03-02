@@ -95,10 +95,10 @@ impl Display for StateMachine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Peer{}(i={}, t={}, ll={}, ci={}, la={})",
+            "{}(i={}, t={}, ll={}, ci={}, la={})",
             match self.state {
-                ServerState::Leader => "*",
-                _ => "",
+                ServerState::Leader => "L",
+                _ => "F",
             },
             self.id,
             self.current_term,
@@ -181,11 +181,11 @@ impl StateMachine {
                     },
                     Message::AppendEntries{req, resp } => {
                         if req.term > self.current_term {
-                            info!(peer = %self, new_leader_id = req.leader_id, new_leader_term = req.term, "found new leader with greated term, converting to follower");
+                            info!(new_leader_id = req.leader_id, new_leader_term = req.term, "found new leader with greated term, converting to follower");
                             self.convert_to_follower();
                             let _ = resp.send(self.append_entries(req));
                         } else {
-                            info!(peer = %self, offender_id = req.leader_id, offender_term = req.term, "found unexpected leader");
+                            info!(offender_id = req.leader_id, offender_term = req.term, "found unexpected leader");
                         }
                     },
                     Message::AppendEntriesResponse{peer_id, replicated_index} => {
@@ -224,7 +224,7 @@ impl StateMachine {
             Some(msg) = self.rx_msgs.recv() => {
                 match msg {
                     Message::Get { key, resp } => {
-                        let _ = resp.send(self.get_data(&key));
+                        let _ = resp.send(self.get_data(&key)); // NB: reads from followers are eventually consistent and may lag behind leader even in normal mode (right after leader got quorum and committed write)
                     }
                     Message::Set { key: _, value: _, resp } => {
                         let _ = resp.send(Err(anyhow!("i'm follower")));    // TODO: proxy request to leader?
@@ -240,6 +240,7 @@ impl StateMachine {
                             self.set_term(req.term);
                         }
                         let _ = resp.send(self.append_entries(req));
+                        warn!(state = %self, "apppplied");
                     },
                     Message::AppendEntriesResponse{ .. } => {
                         // don't care as follower
@@ -269,7 +270,7 @@ impl StateMachine {
                         if req.term > self.current_term {
                             // leader was elected and already send AppendEntries
                             self.set_term(req.term);
-                            debug!(peer = %self, term = req.term, "got AppendEntries with greater term");
+                            debug!(term = req.term, "got AppendEntries with greater term");
                             self.convert_to_follower();
                         }
                         let _ = resp.send(self.append_entries(req));
@@ -278,11 +279,11 @@ impl StateMachine {
                         // don't care as candidate
                     }
                     Message::ReceiveVote(vote) => {
-                        info!(peer = %self, votes_received = self.votes_received, vote_granted = vote.vote_granted, "vote result");
+                        info!(votes_received = self.votes_received, vote_granted = vote.vote_granted, "vote result");
                         if vote.term > self.current_term {
                             // we are stale
                             self.set_term(vote.term);
-                            debug!(peer = %self, term = vote.term, "got RequestVote reply with greater term");
+                            debug!(term = vote.term, "got RequestVote reply with greater term");
                             self.convert_to_follower()
                         } else if vote.term == self.current_term && vote.vote_granted {
                             self.votes_received += 1;
@@ -307,7 +308,11 @@ impl StateMachine {
                 success: false,
             });
         }
-        debug!(peer = %self, leader_commit = req.leader_commit, entries_count = req.entries.len(), "AppendEntries");
+        debug!(
+            leader_commit = req.leader_commit,
+            entries_count = req.entries.len(),
+            "AppendEntries"
+        );
         self.election_timeout = Self::next_election_timeout(None);
 
         let prev_log_index = req.prev_log_index as EntryIdx;
@@ -326,6 +331,7 @@ impl StateMachine {
 
         if prev_log_index > self.log.len() || self.log[prev_log_index - 1].term != req.prev_log_term
         {
+            debug!(state = %self, prev_log_index = prev_log_index, prev_log_term = req.prev_log_term, entry_term = self.log[prev_log_index -1].term, "i'm lagging?");
             // we don't have matching log entry at prev_log_index
             return Ok(grpc::AppendEntriesResponse {
                 term: self.current_term,
@@ -367,7 +373,7 @@ impl StateMachine {
         if req.term > self.current_term {
             // candidate is more recent
             self.set_term(req.term);
-            debug!(peer = %self, term = req.term, "got RequestVote with greater term");
+            debug!(term = req.term, "got RequestVote with greater term");
             self.convert_to_follower();
         }
 
@@ -396,7 +402,7 @@ impl StateMachine {
     }
 
     fn convert_to_candidate(&mut self) {
-        info!(peer = %self, "converting to candidate");
+        info!("converting to candidate");
         self.state = ServerState::Candidate;
         self.current_term += 1;
         self.voted_for = Some(self.id);
@@ -423,7 +429,7 @@ impl StateMachine {
     }
 
     fn convert_to_follower(&mut self) {
-        info!(peer = %self, "converting to follower");
+        info!("converting to follower");
         self.state = ServerState::Follower;
         self.next_idx.clear();
         self.match_idx.clear();
@@ -431,15 +437,16 @@ impl StateMachine {
     }
 
     fn convert_to_leader(&mut self) {
-        info!(peer = %self, "converting to leader");
+        info!("converting to leader");
         self.state = ServerState::Leader;
         self.next_idx.clear();
-        for peer in 0..self.peers.len() {
+        self.match_idx.clear();
+        for _ in 0..self.peers.len() {
             self.next_idx.push(NextIdx {
                 idx: self.last_applied_idx + 1,
                 update_timeout: None,
             });
-            self.match_idx[peer] = 0;
+            self.match_idx.push(0);
         }
         self.send_heartbeat();
     }
@@ -450,10 +457,6 @@ impl StateMachine {
 
     fn last_log_term(&self) -> u64 {
         self.log.last().map_or(0, |e| e.term)
-    }
-
-    fn followers(&self) -> impl Iterator<Item = usize> + use<'_> {
-        (0..self.peers.len()).into_iter().filter(|x| *x != self.id)
     }
 
     async fn request_vote_from_peer(
@@ -510,18 +513,23 @@ impl StateMachine {
         let entries_count = entries.len();
         let update_timeout = Instant::now() + UPDATE_TIMEOUT;
         self.next_idx[peer].update_timeout = Some(update_timeout);
+        let prev_log_term = if prev_log_idx == 0 {
+            0
+        } else {
+            self.log[prev_log_idx - 1].term
+        };
         let req = grpc::AppendEntriesRequest {
             term: self.current_term,
             leader_id: self.id as u32,
             prev_log_index: prev_log_idx as u64,
-            prev_log_term: self.log.get(prev_log_idx).map_or(0, |e| e.term),
+            prev_log_term,
             entries,
             leader_commit: self.commit_idx as u64,
         };
         task::spawn(async move {
             select! {
                 _ = time::sleep_until(update_timeout) => {
-                    warn!(peer = _self, follower = peer, "AppendEntries timed out")
+                    warn!(follower = peer, "AppendEntries timed out")
                 },
                 resp = client.append_entries(req) => {
                     match resp {
@@ -539,12 +547,7 @@ impl StateMachine {
                         }
                         Err(err) => {
                             // retries are supposed to be part of raft logic itself
-                            error!(
-                                peer = _self,
-                                follower = peer,
-                                error = %err,
-                                "sending AppendEntries"
-                            );
+                            error!(follower = peer, error = %err, "sending AppendEntries" );
                         }
                     }
                 }
@@ -595,7 +598,7 @@ impl StateMachine {
             warn!("reporter done");
         });
 
-        debug!(peer = %self, index = self.last_applied_idx, "wrote new entry");
+        debug!(index = self.last_applied_idx, "wrote new entry");
     }
 
     fn maybe_apply_log(&mut self) -> bool {
@@ -608,7 +611,7 @@ impl StateMachine {
             "(applying log entries) last_applied_idx > log length"
         );
 
-        debug!(peer = %self, index = self.last_applied_idx, "applying log entry");
+        debug!(index = self.last_applied_idx, "applying log entry");
         let cmd = self.log[self.last_applied_idx - 1].command.clone().unwrap();
         let old_value = self.data.insert(cmd.key, cmd.value);
         if let Some(chan) = self.pending_transactions.remove(&self.last_applied_idx) {
@@ -624,13 +627,16 @@ impl StateMachine {
                 continue;
             }
             let next_idx = self.next_idx.get_mut(peer).unwrap();
-            if next_idx.update_timeout.is_none() && next_idx.idx <= last_log_idx {
+            let ok_to_update = next_idx
+                .update_timeout
+                .map_or(true, |x| Instant::now() >= x);
+            if ok_to_update && next_idx.idx <= last_log_idx {
                 debug!(
                     follower = peer,
                     follower_next_idx = next_idx.idx,
                     "updating follower"
                 );
-                let entries = self.log[self.next_idx[peer].idx + 1..].to_vec();
+                let entries = self.log[self.next_idx[peer].idx - 1..].to_vec();
                 self.send_entries(peer, entries);
             }
         }
@@ -649,7 +655,7 @@ impl StateMachine {
         while i > self.commit_idx {
             let in_sync = self.match_idx.iter().filter(|idx| **idx >= i).count();
             if in_sync >= self.quorum as usize && self.log[i - 1].term == self.current_term {
-                debug!(peer = %self, index = i, in_sync = in_sync, "got quorum on log entry");
+                debug!(index = i, in_sync = in_sync, "got quorum on log entry");
                 self.commit_idx = i;
                 return true;
             }
@@ -665,7 +671,8 @@ impl StateMachine {
         let mut peers = Vec::with_capacity(addrs.len());
         for (id, addr) in addrs.into_iter().enumerate() {
             if id == my_id {
-                peers.push(None)
+                peers.push(None);
+                continue;
             }
             println!("connected to {}", addr);
             let ch = Channel::from_shared(addr)?.connect_lazy();

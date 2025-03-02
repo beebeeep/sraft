@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use crate::config::Config;
 use anyhow::Result;
 use api::grpc;
