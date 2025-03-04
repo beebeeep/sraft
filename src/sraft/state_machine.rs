@@ -154,6 +154,7 @@ impl StateMachine {
     }
 
     async fn run_leader(&mut self) {
+        // TODO: count AppendEntries timeout per each follower so they won't timeout
         if self.maybe_update_followers() {
             return;
         }
@@ -301,6 +302,7 @@ impl StateMachine {
         &mut self,
         req: grpc::AppendEntriesRequest,
     ) -> Result<grpc::AppendEntriesResponse> {
+        debug!("appendEntries");
         if req.term < self.current_term {
             // stale leader, reject RPC
             return Ok(grpc::AppendEntriesResponse {
@@ -331,7 +333,7 @@ impl StateMachine {
 
         if prev_log_index > self.log.len() || self.log[prev_log_index - 1].term != req.prev_log_term
         {
-            debug!(state = %self, prev_log_index = prev_log_index, prev_log_term = req.prev_log_term, entry_term = self.log[prev_log_index -1].term, "i'm lagging?");
+            debug!(state = %self, prev_log_index = prev_log_index, prev_log_term = req.prev_log_term, "i'm lagging?");
             // we don't have matching log entry at prev_log_index
             return Ok(grpc::AppendEntriesResponse {
                 term: self.current_term,
@@ -572,6 +574,7 @@ impl StateMachine {
                 value,
             }),
         });
+        self.match_idx[self.id] = self.last_log_index();
 
         // the transaction was inserted to log and will be sent to all followers in next iteration of leader loop
         // following future will wait for it to be commited and will respond to client
