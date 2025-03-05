@@ -153,7 +153,6 @@ impl StateMachine {
     }
 
     async fn run_leader(&mut self) {
-        // TODO: count AppendEntries timeout per each follower so they won't timeout
         if self.maybe_update_followers() {
             return;
         }
