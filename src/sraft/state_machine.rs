@@ -18,15 +18,20 @@ use tracing::debug;
 use tracing::warn;
 use tracing::{error, info};
 
-const IDLE_TIMEOUT: Duration = Duration::from_millis(2000);
+const IDLE_TIMEOUT: Duration = Duration::from_millis(1500); // time between idling follower heartbeats
+const TICK_TIMEOUT: Duration = Duration::from_millis(300); // main leader loop timeout
 const ELECTION_TIMEOUT_MS: Range<u64> = 2500..3000;
 const UPDATE_TIMEOUT: Duration = Duration::from_millis(300);
 
 type PeerID = usize;
 type EntryIdx = usize; // log entry index, STARTS FROM 1
-struct NextIdx {
-    idx: EntryIdx,
+
+struct PeerState {
+    client: SraftClient<Channel>,
+    next_idx: EntryIdx,
+    match_idx: EntryIdx,
     update_timeout: Option<Instant>,
+    next_heartbeat: Instant,
 }
 
 pub enum ServerState {
@@ -68,7 +73,7 @@ pub struct StateMachine {
     rx_msgs: mpsc::Receiver<Message>,
     tx_msgs: mpsc::Sender<Message>,
     data: HashMap<String, Vec<u8>>,
-    peers: Vec<Option<SraftClient<Channel>>>,
+    peers: Vec<PeerState>,
     quorum: u32,
     election_timeout: Instant,
     pending_transactions: HashMap<EntryIdx, oneshot::Sender<Option<Vec<u8>>>>,
@@ -85,10 +90,6 @@ pub struct StateMachine {
 
     // volatile state on candidate
     votes_received: u32,
-
-    // volatile state on leader
-    next_idx: Vec<NextIdx>,
-    match_idx: Vec<EntryIdx>,
 }
 
 impl Display for StateMachine {
@@ -122,7 +123,7 @@ impl StateMachine {
             tx_msgs,
             data: HashMap::new(),
             quorum: (peers.len() / 2 + 1) as u32,
-            peers: Self::connect_to_peers(id, peers)?,
+            peers: Self::init_peers(peers)?,
             election_timeout: Self::next_election_timeout(Some(100..200)),
             pending_transactions: HashMap::new(),
 
@@ -135,8 +136,6 @@ impl StateMachine {
             state: ServerState::Follower,
             commit_idx: 0,
             last_applied_idx: 0,
-            next_idx: Vec::new(),
-            match_idx: Vec::new(),
         })
     }
 
@@ -163,8 +162,8 @@ impl StateMachine {
         }
 
         select! {
-            _ = time::sleep(IDLE_TIMEOUT) => {
-                self.send_heartbeat();
+            _ = time::sleep(TICK_TIMEOUT) => {
+                return;
             },
             Some(msg) = self.rx_msgs.recv() => {
                 match msg {
@@ -190,7 +189,7 @@ impl StateMachine {
                         }
                     },
                     Message::AppendEntriesResponse{peer_id, replicated_index} => {
-                        let Some(next_idx) = self.next_idx.get_mut(peer_id) else {
+                        let Some(peer) = self.peers.get_mut(peer_id) else {
                             return;
                         };
                         if let Some(replicated_index) = replicated_index {
@@ -199,17 +198,17 @@ impl StateMachine {
                                 replicated_index = replicated_index,
                                 "follower replicated entries"
                             );
-                                next_idx.idx = replicated_index + 1;
-                                next_idx.update_timeout = None;
-                                self.match_idx[peer_id] = replicated_index;
+                                peer.next_idx = replicated_index + 1;
+                                peer.match_idx = replicated_index;
+                                peer.update_timeout = None;
                         } else {
                             // follower failed AppendEntries, will retry with earlier log entries
                             debug!(
                                 follower = peer_id,
                                 "follower is lagging"
                             );
-                            next_idx.idx -= 1;
-                            next_idx.update_timeout = None;
+                            peer.next_idx -= 1;
+                            peer.update_timeout = None;
                         }
                     }
                 }
@@ -322,7 +321,7 @@ impl StateMachine {
         let prev_log_index = req.prev_log_index as EntryIdx;
         if prev_log_index == 0 {
             // special case: we just bootstraped the cluster and log is empty
-            debug_assert!(self.log.is_empty()); // not sure about that
+            debug_assert!(self.log.is_empty()); // not sure about that, sometimes unexpectedly fails. TODO: check
             self.log.extend(req.entries);
             if req.leader_commit as EntryIdx > self.commit_idx {
                 self.commit_idx = usize::min(req.leader_commit as usize, self.last_log_index());
@@ -412,16 +411,14 @@ impl StateMachine {
         self.voted_for = Some(self.id);
         self.votes_received = 1;
         self.election_timeout = Self::next_election_timeout(None);
-        self.next_idx.clear();
-        self.match_idx.clear();
 
         // request votes from all peers in parallel
-        for (id, client) in self.peers.iter().enumerate() {
+        for (id, peer) in self.peers.iter().enumerate() {
             if self.id == id {
                 continue;
             }
             task::spawn(Self::request_vote_from_peer(
-                client.as_ref().unwrap().clone(),
+                peer.client.clone(),
                 id,
                 self.tx_msgs.clone(),
                 self.current_term,
@@ -435,24 +432,18 @@ impl StateMachine {
     fn convert_to_follower(&mut self) {
         info!("converting to follower");
         self.state = ServerState::Follower;
-        self.next_idx.clear();
-        self.match_idx.clear();
         self.pending_transactions.clear();
     }
 
     fn convert_to_leader(&mut self) {
         info!("converting to leader");
         self.state = ServerState::Leader;
-        self.next_idx.clear();
-        self.match_idx.clear();
-        for _ in 0..self.peers.len() {
-            self.next_idx.push(NextIdx {
-                idx: self.last_applied_idx + 1,
-                update_timeout: None,
-            });
-            self.match_idx.push(0);
+        for peer in &mut self.peers {
+            peer.next_idx = self.last_applied_idx + 1;
+            peer.update_timeout = None;
+            peer.next_heartbeat = Instant::now();
+            peer.match_idx = 0;
         }
-        self.send_heartbeat();
     }
 
     fn last_log_index(&self) -> EntryIdx {
@@ -498,25 +489,16 @@ impl StateMachine {
         }
     }
 
-    fn send_heartbeat(&mut self) {
-        for peer in 0..self.peers.len() {
-            if self.id == peer {
-                continue;
-            }
-            self.send_entries(peer, Vec::new());
-        }
-    }
-
     fn send_entries(&mut self, peer: PeerID, entries: Vec<grpc::LogEntry>) {
-        let client = self.peers[peer].as_ref().unwrap();
+        let mut client = self.peers[peer].client.clone();
         let msgs = self.tx_msgs.clone();
-        let mut client = client.clone();
         let _self = format!("{self}");
-        let prev_log_idx = self.next_idx[peer].idx - 1;
+        let prev_log_idx = self.peers[peer].next_idx - 1;
 
         let entries_count = entries.len();
         let update_timeout = Instant::now() + UPDATE_TIMEOUT;
-        self.next_idx[peer].update_timeout = Some(update_timeout);
+        self.peers[peer].update_timeout = Some(update_timeout);
+        self.peers[peer].next_heartbeat = Instant::now() + IDLE_TIMEOUT;
         let prev_log_term = if prev_log_idx == 0 {
             0
         } else {
@@ -576,7 +558,7 @@ impl StateMachine {
                 value,
             }),
         });
-        self.match_idx[self.id] = self.last_log_index();
+        self.peers[self.id].match_idx = self.last_log_index();
 
         // the transaction was inserted to log and will be sent to all followers in next iteration of leader loop
         // following future will wait for it to be commited and will respond to client
@@ -627,22 +609,28 @@ impl StateMachine {
 
     fn maybe_update_followers(&mut self) -> bool {
         let last_log_idx = self.last_log_index();
-        for peer in 0..self.peers.len() {
-            if peer == self.id {
+        for peer_id in 0..self.peers.len() {
+            if peer_id == self.id {
                 continue;
             }
-            let next_idx = self.next_idx.get_mut(peer).unwrap();
-            let ok_to_update = next_idx
-                .update_timeout
-                .map_or(true, |x| Instant::now() >= x);
-            if ok_to_update && next_idx.idx <= last_log_idx {
+
+            let peer = &mut self.peers[peer_id];
+            let ok_to_update = peer.update_timeout.map_or(true, |x| Instant::now() >= x);
+            if !ok_to_update {
+                continue;
+            }
+
+            if peer.next_idx <= last_log_idx {
+                // peer is lagging
                 debug!(
-                    follower = peer,
-                    follower_next_idx = next_idx.idx,
+                    follower = peer_id,
+                    follower_next_idx = peer.next_idx,
                     "updating follower"
                 );
-                let entries = self.log[self.next_idx[peer].idx - 1..].to_vec();
-                self.send_entries(peer, entries);
+                let entries = self.log[peer.next_idx - 1..].to_vec();
+                self.send_entries(peer_id, entries);
+            } else if Instant::now() >= peer.next_heartbeat {
+                self.send_entries(peer_id, Vec::new());
             }
         }
         false
@@ -658,7 +646,7 @@ impl StateMachine {
         }
         let mut i = self.last_log_index();
         while i > self.commit_idx {
-            let in_sync = self.match_idx.iter().filter(|idx| **idx >= i).count();
+            let in_sync = self.peers.iter().filter(|p| p.match_idx >= i).count();
             if in_sync >= self.quorum as usize && self.log[i - 1].term == self.current_term {
                 debug!(index = i, in_sync = in_sync, "got quorum on log entry");
                 self.commit_idx = i;
@@ -669,19 +657,18 @@ impl StateMachine {
         false
     }
 
-    fn connect_to_peers(
-        my_id: PeerID,
-        addrs: Vec<String>,
-    ) -> Result<Vec<Option<SraftClient<Channel>>>> {
+    fn init_peers(addrs: Vec<String>) -> Result<Vec<PeerState>> {
         let mut peers = Vec::with_capacity(addrs.len());
-        for (id, addr) in addrs.into_iter().enumerate() {
-            if id == my_id {
-                peers.push(None);
-                continue;
-            }
+        for addr in addrs.into_iter() {
             println!("connected to {}", addr);
             let ch = Channel::from_shared(addr)?.connect_lazy();
-            peers.push(Some(SraftClient::new(ch)));
+            peers.push(PeerState {
+                client: SraftClient::new(ch),
+                next_idx: 0,
+                match_idx: 0,
+                update_timeout: None,
+                next_heartbeat: Instant::now(),
+            });
         }
         Ok(peers)
     }

@@ -3,7 +3,7 @@ use grpc::{
     GetRequest, GetResponse, RequestVoteRequest, RequestVoteResponse, SetRequest, SetResponse,
 };
 use tonic::{Request, Response, Status};
-use tracing::{error, info};
+use tracing::error;
 
 pub mod grpc {
     tonic::include_proto!("sraft");
