@@ -225,7 +225,9 @@ impl StateMachine {
             Some(msg) = self.rx_msgs.recv() => {
                 match msg {
                     Message::Get { key, resp } => {
-                        let _ = resp.send(self.get_data(&key)); // NB: reads from followers are eventually consistent and may lag behind leader even in normal mode (right after leader got quorum and committed write)
+                        // NB: reads from followers are eventually consistent and may lag behind leader
+                        // even in normal mode (right after leader got quorum and committed write)
+                        let _ = resp.send(self.get_data(&key));
                     }
                     Message::Set { key: _, value: _, resp } => {
                         let _ = resp.send(Err(anyhow!("i'm follower")));    // TODO: proxy request to leader?
