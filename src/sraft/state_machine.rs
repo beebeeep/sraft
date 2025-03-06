@@ -4,6 +4,7 @@ use std::ops::Range;
 use std::time::Duration;
 
 use super::api::grpc::{self, sraft_client::SraftClient};
+use crate::sraft::storage;
 use anyhow::{anyhow, Result};
 use rand::rng;
 use rand::Rng;
@@ -82,6 +83,7 @@ pub struct StateMachine {
     current_term: u64,
     voted_for: Option<PeerID>,
     log: Vec<grpc::LogEntry>,
+    storage: storage::NodeStorage,
 
     // volatile state
     state: ServerState,
@@ -318,20 +320,10 @@ impl StateMachine {
         self.election_timeout = Self::next_election_timeout(None);
 
         let prev_log_index = req.prev_log_index as EntryIdx;
-        if prev_log_index == 0 {
-            // special case: we just bootstraped the cluster and log is empty
-            debug_assert!(self.log.is_empty()); // not sure about that, sometimes unexpectedly fails. TODO: check
-            self.log.extend(req.entries);
-            if req.leader_commit as EntryIdx > self.commit_idx {
-                self.commit_idx = usize::min(req.leader_commit as usize, self.last_log_index());
-            }
-            return Ok(grpc::AppendEntriesResponse {
-                term: self.current_term,
-                success: true,
-            });
-        }
 
-        if prev_log_index > self.log.len() || self.log[prev_log_index - 1].term != req.prev_log_term
+        if prev_log_index != 0
+            && (prev_log_index > self.log.len()
+                || self.log[prev_log_index - 1].term != req.prev_log_term)
         {
             debug!(state = %self, prev_log_index = prev_log_index, prev_log_term = req.prev_log_term, "i'm lagging?");
             // we don't have matching log entry at prev_log_index

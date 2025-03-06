@@ -7,6 +7,7 @@ use tracing::info;
 
 pub mod api;
 mod state_machine;
+mod storage;
 
 pub struct SraftNode {
     actions: mpsc::Sender<Message>,
