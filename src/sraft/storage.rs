@@ -32,7 +32,8 @@ impl NodeStorage {
             .open_partition("metadata", fjall::PartitionCreateOptions::default())
             .context("opening metadata keyspace")?;
 
-        let last_log_idx = Self::check_log(&log).context("checking log consistency")?;
+        let (last_entry, last_log_idx) =
+            Self::check_log(&log).context("checking log consistency")?;
         let mut buf = [0; 8];
         let voted_for = metadata
             .get(KEY_VOTED_FOR)
@@ -56,7 +57,7 @@ impl NodeStorage {
             log,
             metadata,
             last_log_idx,
-            last_log_term,
+            last_log_term: last_entry.term,
             voted_for,
             current_term,
         })
@@ -89,8 +90,19 @@ impl NodeStorage {
         self.last_log_idx
     }
 
-    pub(super) fn get_voted_for(&self) -> Option<usize> {
+    pub(super) fn last_log_term(&self) -> u64 {
+        self.last_log_term
+    }
+
+    pub(super) fn voted_for(&self) -> Option<usize> {
         self.voted_for
+    }
+
+    pub(super) async fn reset_voted_for(&mut self) -> Result<()> {
+        let metadata = self.metadata.clone();
+        task::spawn_blocking(move || metadata.remove(KEY_VOTED_FOR)).await?;
+        self.voted_for = None;
+        Ok(())
     }
 
     pub(super) async fn set_voted_for(&mut self, peer: usize) -> Result<()> {
@@ -118,10 +130,12 @@ impl NodeStorage {
     pub(super) async fn append_to_log(&mut self, entry: grpc::LogEntry) -> Result<()> {
         let log = self.log.clone();
         let last_log_idx = self.last_log_idx + 1;
+        let last_log_term = entry.term;
         task::spawn_blocking(move || log.insert(last_log_idx.to_be_bytes(), entry.encode_to_vec()))
             .await
             .context("writing to storage")??;
         self.last_log_idx += 1;
+        self.last_log_term = last_log_term;
         Ok(())
     }
 
@@ -142,15 +156,24 @@ impl NodeStorage {
     pub(super) async fn truncate_log(&mut self, start_idx: usize) -> Result<()> {
         let log = self.log.clone();
         let last_idx = self.last_log_idx;
-        task::spawn_blocking(move || -> Result<()> {
+        let last_term = task::spawn_blocking(move || -> Result<u64> {
             for idx in start_idx..=last_idx {
                 log.remove(idx.to_be_bytes())
                     .context("removing log entry")?;
             }
-            Ok(())
+            if let Some(e) = log
+                .get((start_idx - 1).to_be_bytes())
+                .context("reading log entry")?
+            {
+                let entry = grpc::LogEntry::decode(e.as_ref()).context("decoding log entry")?;
+                Ok(entry.term)
+            } else {
+                Ok(0)
+            }
         })
         .await??;
         self.last_log_idx = start_idx - 1;
+        self.last_log_term = last_term;
         Ok(())
     }
 

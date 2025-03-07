@@ -106,7 +106,7 @@ impl Display for StateMachine {
             },
             self.id,
             self.storage.current_term(),
-            self.last_log_index(),
+            self.storage.last_log_idx(),
             self.commit_idx,
             self.last_applied_idx
         )
@@ -179,7 +179,7 @@ impl StateMachine {
                         self.set_data(&key, value, resp);
                     }
                     Message::RequestVote { req, resp } => {
-                        let _ = resp.send(self.request_vote(req)); // NB: not clear what shall we do here?
+                        let _ = resp.send(self.request_vote(req).await.context("voting for candidate")); // NB: not clear what shall we do here?
                     },
                     Message::ReceiveVote(_) => {
                         // don't care as we are leader already
@@ -188,7 +188,7 @@ impl StateMachine {
                         if req.term > self.storage.current_term() {
                             info!(new_leader_id = req.leader_id, new_leader_term = req.term, "found new leader with greated term, converting to follower");
                             self.convert_to_follower();
-                            let _ = resp.send(self.append_entries(req));
+                            let _ = resp.send(self.append_entries(req).await.context("appending entries"));
                         } else {
                             info!(offender_id = req.leader_id, offender_term = req.term, "found unexpected leader");
                         }
@@ -380,27 +380,27 @@ impl StateMachine {
 
         if self
             .storage
-            .get_voted_for()
+            .voted_for()
             .map_or(true, |v| v == req.candidate_id as usize)
-            && self.last_log_term() <= req.last_log_term
+            && self.storage.last_log_term() <= req.last_log_term
         {
             // if we haven't voted or or already voted for that candidate, vote for candidate
             // if it's log is at least up-to-date as ours
-            self.voted_for = Some(req.candidate_id as usize);
+            self.storage.set_voted_for(req.candidate_id as usize).await?;
             return Ok(grpc::RequestVoteResponse {
-                term: self.current_term,
+                term: self.storage.current_term(),
                 vote_granted: true,
             });
         }
         Ok(grpc::RequestVoteResponse {
-            term: self.current_term,
+            term: self.storage.current_term(),
             vote_granted: false,
         })
     }
 
-    fn set_term(&mut self, term: u64) {
-        self.current_term = term;
-        self.voted_for = None;
+    async fn set_term(&mut self, term: u64) -> Result<()> {
+        self.storage.set_current_term(term).await?;
+        self.storage.reset_voted_for().await
     }
 
     fn convert_to_candidate(&mut self) {
@@ -490,11 +490,7 @@ impl StateMachine {
         let update_timeout = Instant::now() + UPDATE_TIMEOUT;
         self.peers[peer].update_timeout = Some(update_timeout);
         self.peers[peer].next_heartbeat = Instant::now() + IDLE_TIMEOUT;
-        let prev_log_term = if prev_log_idx == 0 {
-            0
-        } else {
-            self.log[prev_log_idx - 1].term
-        };
+        let prev_log_term = self.storage.
         let req = grpc::AppendEntriesRequest {
             term: self.current_term,
             leader_id: self.id as u32,
