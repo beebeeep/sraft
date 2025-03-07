@@ -25,3 +25,7 @@ tonic-build = { version = "0.11.0", features = ["prost"] }
 [[bin]]
 name = "bench"
 path = "src/bench/main.rs"
+
+[[bin]]
+name = "scratch"
+path = "src/scratch/main.rs"

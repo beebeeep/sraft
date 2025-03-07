@@ -13,6 +13,7 @@ pub struct Config {
     pub host: Option<String>,
     pub port: u16,
     pub peers: Vec<PeerCfg>,
+    pub data_dir: String,
 }
 
 impl Config {
