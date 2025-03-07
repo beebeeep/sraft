@@ -153,6 +153,14 @@ impl NodeStorage {
         .await?
     }
 
+    pub(super) async fn get_logs_since(&self, start_idx: usize) -> Result<Vec<grpc::LogEntry>> {
+        let mut result = Vec::with_capacity(self.last_log_idx - start_idx);
+        for idx in start_idx..=self.last_log_idx {
+            result.push(self.get_log_entry(idx).await?);
+        }
+        Ok(result)
+    }
+
     pub(super) async fn truncate_log(&mut self, start_idx: usize) -> Result<()> {
         let log = self.log.clone();
         let last_idx = self.last_log_idx;
