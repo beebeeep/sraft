@@ -71,16 +71,11 @@ pub struct StateMachine<S: storage::Store> {
     id: PeerID,
     rx_msgs: mpsc::Receiver<Message>,
     tx_msgs: mpsc::Sender<Message>,
-    // data: HashMap<String, Vec<u8>>,
     peers: Vec<PeerState>,
     quorum: u32,
     election_timeout: Instant,
     pending_transactions: HashMap<EntryIdx, oneshot::Sender<Option<Vec<u8>>>>,
 
-    // persistent state
-    // current_term: u64,
-    // voted_for: Option<PeerID>,
-    // log: Vec<grpc::LogEntry>,
     storage: S,
 
     // volatile state
