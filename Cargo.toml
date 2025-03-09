@@ -8,8 +8,10 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.96"
 clap = { version = "4.5.30", features = ["derive"] }
+fjall = "2.6.7"
 prost = "0.12.6"
 rand = "0.9.0"
+rusqlite = "0.34.0"
 serde = { version = "1.0.218", features = ["derive"] }
 tokio = { version = "1.38.0", features = ["full", "macros", "rt-multi-thread"] }
 toml = "0.8.20"
@@ -23,3 +25,7 @@ tonic-build = { version = "0.11.0", features = ["prost"] }
 [[bin]]
 name = "bench"
 path = "src/bench/main.rs"
+
+[[bin]]
+name = "scratch"
+path = "src/scratch/main.rs"

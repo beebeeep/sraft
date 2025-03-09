@@ -4,7 +4,8 @@ use std::ops::Range;
 use std::time::Duration;
 
 use super::api::grpc::{self, sraft_client::SraftClient};
-use anyhow::{anyhow, Result};
+use crate::sraft::storage;
+use anyhow::{anyhow, Context, Result};
 use rand::rng;
 use rand::Rng;
 use tokio::select;
@@ -14,9 +15,7 @@ use tokio::task;
 use tokio::time;
 use tokio::time::Instant;
 use tonic::transport::Channel;
-use tracing::debug;
-use tracing::warn;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 const IDLE_TIMEOUT: Duration = Duration::from_millis(1500); // time between idling follower heartbeats
 const TICK_TIMEOUT: Duration = Duration::from_millis(300); // main leader loop timeout
@@ -68,20 +67,21 @@ pub enum Message {
     },
 }
 
-pub struct StateMachine {
+pub struct StateMachine<S: storage::Store> {
     id: PeerID,
     rx_msgs: mpsc::Receiver<Message>,
     tx_msgs: mpsc::Sender<Message>,
-    data: HashMap<String, Vec<u8>>,
+    // data: HashMap<String, Vec<u8>>,
     peers: Vec<PeerState>,
     quorum: u32,
     election_timeout: Instant,
     pending_transactions: HashMap<EntryIdx, oneshot::Sender<Option<Vec<u8>>>>,
 
     // persistent state
-    current_term: u64,
-    voted_for: Option<PeerID>,
-    log: Vec<grpc::LogEntry>,
+    // current_term: u64,
+    // voted_for: Option<PeerID>,
+    // log: Vec<grpc::LogEntry>,
+    storage: S,
 
     // volatile state
     state: ServerState,
@@ -92,7 +92,7 @@ pub struct StateMachine {
     votes_received: u32,
 }
 
-impl Display for StateMachine {
+impl<S: storage::Store> Display for StateMachine<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -102,18 +102,19 @@ impl Display for StateMachine {
                 _ => "F",
             },
             self.id,
-            self.current_term,
-            self.last_log_index(),
+            self.storage.current_term(),
+            self.storage.last_log_idx(),
             self.commit_idx,
             self.last_applied_idx
         )
     }
 }
 
-impl StateMachine {
+impl<S: storage::Store + 'static> StateMachine<S> {
     pub fn new(
         id: PeerID,
         peers: Vec<String>,
+        store: S,
         rx_msgs: mpsc::Receiver<Message>,
         tx_msgs: mpsc::Sender<Message>,
     ) -> Result<Self> {
@@ -121,18 +122,12 @@ impl StateMachine {
             id,
             rx_msgs,
             tx_msgs,
-            data: HashMap::new(),
             quorum: (peers.len() / 2 + 1) as u32,
             peers: Self::init_peers(peers)?,
             election_timeout: Self::next_election_timeout(Some(100..200)),
             pending_transactions: HashMap::new(),
-
-            current_term: 0,
-            voted_for: None,
-            log: Vec::new(),
-
+            storage: store,
             votes_received: 0,
-
             state: ServerState::Follower,
             commit_idx: 0,
             last_applied_idx: 0,
@@ -141,55 +136,61 @@ impl StateMachine {
 
     pub async fn run(&mut self) {
         loop {
-            if self.maybe_apply_log() {
-                continue;
+            match self.maybe_apply_log().await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(err) => {
+                    error!(error = format!("{err:#}"), "applying log");
+                }
             }
-            match self.state {
+            let err = match self.state {
                 ServerState::Leader => self.run_leader().await,
                 ServerState::Follower => self.run_follower().await,
                 ServerState::Candidate => self.run_candidate().await,
+            };
+            match err {
+                Ok(_) => {}
+                Err(err) => error!(error = format!("{err:#}"), "got error"),
             }
         }
     }
 
-    async fn run_leader(&mut self) {
-        if self.maybe_update_followers() {
-            return;
-        }
-        if self.maybe_update_commit_idx() {
-            return;
-        }
+    async fn run_leader(&mut self) -> Result<()> {
+        self.maybe_update_followers()
+            .await
+            .context("updating followers")?;
+        self.maybe_update_commit_idx()
+            .await
+            .context("updating commitIndex")?;
 
         select! {
-            _ = time::sleep(TICK_TIMEOUT) => {
-                return;
-            },
+            _ = time::sleep(TICK_TIMEOUT) => {},
             Some(msg) = self.rx_msgs.recv() => {
                 match msg {
                     Message::Get { key, resp } => {
-                        let _ = resp.send(self.get_data(&key));
+                        self.get_data(&key, resp).await?;
                     }
                     Message::Set { key, value, resp } => {
-                        self.set_data(&key, value, resp);
+                         self.set_data(&key, value, resp).await?;
                     }
                     Message::RequestVote { req, resp } => {
-                        let _ = resp.send(self.request_vote(req)); // NB: not clear what shall we do here?
+                        let _ = resp.send(self.request_vote(req).await.context("voting for candidate")); // NB: not clear what shall we do here?
                     },
                     Message::ReceiveVote(_) => {
                         // don't care as we are leader already
                     },
                     Message::AppendEntries{req, resp } => {
-                        if req.term > self.current_term {
+                        if req.term > self.storage.current_term() {
                             info!(new_leader_id = req.leader_id, new_leader_term = req.term, "found new leader with greated term, converting to follower");
                             self.convert_to_follower();
-                            let _ = resp.send(self.append_entries(req));
+                            let _ = resp.send(self.append_entries(req).await.context("appending entries"));
                         } else {
                             info!(offender_id = req.leader_id, offender_term = req.term, "found unexpected leader");
                         }
                     },
                     Message::AppendEntriesResponse{peer_id, replicated_index} => {
                         let Some(peer) = self.peers.get_mut(peer_id) else {
-                            return;
+                            return Err(anyhow!("got AppendEntries response from unknown peer {peer_id}"));
                         };
                         if let Some(replicated_index) = replicated_index {
                             debug!(
@@ -213,35 +214,35 @@ impl StateMachine {
                 }
             }
         }
+        Ok(())
     }
 
-    async fn run_follower(&mut self) {
+    async fn run_follower(&mut self) -> Result<()> {
         select! {
             _ = time::sleep_until(self.election_timeout) => {
-                self.convert_to_candidate();
+                self.convert_to_candidate().await.context("converting to candidate")?;
             },
             Some(msg) = self.rx_msgs.recv() => {
                 match msg {
                     Message::Get { key, resp } => {
                         // NB: reads from followers are eventually consistent and may lag behind leader
                         // even in normal mode (right after leader got quorum and committed write)
-                        let _ = resp.send(self.get_data(&key));
+                        let _ = resp.send(self.storage.get(&key).await);
                     }
                     Message::Set { key: _, value: _, resp } => {
                         let _ = resp.send(Err(anyhow!("i'm follower")));    // TODO: proxy request to leader?
                     }
                     Message::RequestVote { req, resp } => {
-                        let _ = resp.send(self.request_vote(req));
+                        let _ = resp.send(self.request_vote(req).await.context("requesting vote"));
                     },
                     Message::ReceiveVote(_) => {
                         // don't care as follower
                     },
                     Message::AppendEntries{req, resp } => {
-                        if req.term > self.current_term {
-                            self.set_term(req.term);
+                        if req.term > self.storage.current_term() {
+                            self.set_term(req.term).await.context("setting term")?;
                         }
-                        let _ = resp.send(self.append_entries(req));
-                        warn!(state = %self, "apppplied");
+                        let _ = resp.send(self.append_entries(req).await.context("processing AppendEntries"));
                     },
                     Message::AppendEntriesResponse{ .. } => {
                         // don't care as follower
@@ -249,12 +250,13 @@ impl StateMachine {
                 }
             }
         }
+        Ok(())
     }
 
-    async fn run_candidate(&mut self) {
+    async fn run_candidate(&mut self) -> Result<()> {
         select! {
             _ = time::sleep_until(self.election_timeout) => {
-                self.convert_to_candidate();
+                self.convert_to_candidate().await.context("converting to candidate")?;
             },
             Some(msg) = self.rx_msgs.recv() => {
                 match msg {
@@ -265,28 +267,28 @@ impl StateMachine {
                         let _ = resp.send(Err(anyhow!("election time")));
                     }
                     Message::RequestVote { req, resp } => {
-                        let _ = resp.send(self.request_vote(req));
+                        let _ = resp.send(self.request_vote(req).await.context("requesting vote"));
                     },
                     Message::AppendEntries{req, resp } => {
-                        if req.term > self.current_term {
+                        if req.term > self.storage.current_term() {
                             // leader was elected and already send AppendEntries
-                            self.set_term(req.term);
+                            self.set_term(req.term).await.context("setting new term")?;
                             debug!(term = req.term, "got AppendEntries with greater term");
                             self.convert_to_follower();
                         }
-                        let _ = resp.send(self.append_entries(req));
+                        let _ = resp.send(self.append_entries(req).await.context("processing AppendEntries"));
                     },
                     Message::AppendEntriesResponse { .. } => {
                         // don't care as candidate
                     }
                     Message::ReceiveVote(vote) => {
                         info!(votes_received = self.votes_received, vote_granted = vote.vote_granted, "vote result");
-                        if vote.term > self.current_term {
+                        if vote.term > self.storage.current_term() {
                             // we are stale
-                            self.set_term(vote.term);
+                            self.set_term(vote.term).await.context("setting new term")?;
                             debug!(term = vote.term, "got RequestVote reply with greater term");
                             self.convert_to_follower()
-                        } else if vote.term == self.current_term && vote.vote_granted {
+                        } else if vote.term == self.storage.current_term() && vote.vote_granted {
                             self.votes_received += 1;
                             if self.votes_received >= self.quorum {
                                 self.convert_to_leader();
@@ -296,118 +298,132 @@ impl StateMachine {
                 }
             }
         }
+        Ok(())
     }
 
-    fn append_entries(
+    async fn append_entries(
         &mut self,
         req: grpc::AppendEntriesRequest,
     ) -> Result<grpc::AppendEntriesResponse> {
-        debug!("appendEntries");
-        if req.term < self.current_term {
+        if req.term < self.storage.current_term() {
             // stale leader, reject RPC
             return Ok(grpc::AppendEntriesResponse {
-                term: self.current_term,
+                term: self.storage.current_term(),
                 success: false,
             });
         }
         debug!(
             leader_commit = req.leader_commit,
             entries_count = req.entries.len(),
+            prev_log_idx = req.prev_log_index,
             "AppendEntries"
         );
         self.election_timeout = Self::next_election_timeout(None);
 
         let prev_log_index = req.prev_log_index as EntryIdx;
-        if prev_log_index == 0 {
-            // special case: we just bootstraped the cluster and log is empty
-            debug_assert!(self.log.is_empty()); // not sure about that, sometimes unexpectedly fails. TODO: check
-            self.log.extend(req.entries);
-            if req.leader_commit as EntryIdx > self.commit_idx {
-                self.commit_idx = usize::min(req.leader_commit as usize, self.last_log_index());
-            }
-            return Ok(grpc::AppendEntriesResponse {
-                term: self.current_term,
-                success: true,
-            });
-        }
 
-        if prev_log_index > self.log.len() || self.log[prev_log_index - 1].term != req.prev_log_term
+        if prev_log_index != 0
+            && (prev_log_index > self.storage.last_log_idx()
+                || self.storage.get_log_entry(prev_log_index).await?.term != req.prev_log_term)
         {
             debug!(state = %self, prev_log_index = prev_log_index, prev_log_term = req.prev_log_term, "i'm lagging?");
             // we don't have matching log entry at prev_log_index
             return Ok(grpc::AppendEntriesResponse {
-                term: self.current_term,
+                term: self.storage.current_term(),
                 success: false,
             });
         }
 
         for (i, entry) in req.entries.into_iter().enumerate() {
-            if let Some(e) = self.log.get(prev_log_index + i) {
-                if e.term == entry.term {
-                    // this entry match, skipping
-                    continue;
-                } else {
-                    // conflicting entry, truncate it and all that follow
-                    self.log.truncate(prev_log_index + i);
-                }
+            let next_entry_idx = prev_log_index + 1 + i;
+            if self.storage.last_log_idx() < next_entry_idx {
+                self.storage
+                    .append_to_log(entry)
+                    .await
+                    .context("appending log entry")?;
+                continue;
             }
-            self.log.push(entry);
+
+            let existing_entry = self
+                .storage
+                .get_log_entry(next_entry_idx)
+                .await
+                .context("getting existing log entry")?;
+            if existing_entry.term != entry.term {
+                // conflicting entry, truncate it and all that follow
+                self.storage
+                    .truncate_log(next_entry_idx)
+                    .await
+                    .context("removing conflicting entries from log")?;
+            }
         }
 
         if req.leader_commit as EntryIdx > self.commit_idx {
-            self.commit_idx = usize::min(req.leader_commit as usize, self.last_log_index());
+            self.commit_idx = usize::min(req.leader_commit as usize, self.storage.last_log_idx());
         }
 
         Ok(grpc::AppendEntriesResponse {
-            term: self.current_term,
+            term: self.storage.current_term(),
             success: true,
         })
     }
 
-    fn request_vote(&mut self, req: grpc::RequestVoteRequest) -> Result<grpc::RequestVoteResponse> {
-        if req.term < self.current_term {
+    async fn request_vote(
+        &mut self,
+        req: grpc::RequestVoteRequest,
+    ) -> Result<grpc::RequestVoteResponse> {
+        if req.term < self.storage.current_term() {
             // candidate is stale
             return Ok(grpc::RequestVoteResponse {
-                term: self.current_term,
+                term: self.storage.current_term(),
                 vote_granted: false,
             });
         }
-        if req.term > self.current_term {
+        if req.term > self.storage.current_term() {
             // candidate is more recent
-            self.set_term(req.term);
+            self.set_term(req.term).await.context("setting new term")?;
             debug!(term = req.term, "got RequestVote with greater term");
             self.convert_to_follower();
         }
 
         if self
-            .voted_for
+            .storage
+            .voted_for()
             .map_or(true, |v| v == req.candidate_id as usize)
-            && self.last_log_term() <= req.last_log_term
+            && self.storage.last_log_term() <= req.last_log_term
         {
             // if we haven't voted or or already voted for that candidate, vote for candidate
             // if it's log is at least up-to-date as ours
-            self.voted_for = Some(req.candidate_id as usize);
+            self.storage
+                .set_voted_for(req.candidate_id as usize)
+                .await?;
             return Ok(grpc::RequestVoteResponse {
-                term: self.current_term,
+                term: self.storage.current_term(),
                 vote_granted: true,
             });
         }
         Ok(grpc::RequestVoteResponse {
-            term: self.current_term,
+            term: self.storage.current_term(),
             vote_granted: false,
         })
     }
 
-    fn set_term(&mut self, term: u64) {
-        self.current_term = term;
-        self.voted_for = None;
+    async fn set_term(&mut self, term: u64) -> Result<()> {
+        self.storage.set_current_term(term).await?;
+        self.storage.reset_voted_for().await
     }
 
-    fn convert_to_candidate(&mut self) {
+    async fn convert_to_candidate(&mut self) -> Result<()> {
         info!("converting to candidate");
         self.state = ServerState::Candidate;
-        self.current_term += 1;
-        self.voted_for = Some(self.id);
+        self.storage
+            .set_current_term(self.storage.current_term() + 1)
+            .await
+            .context("incrementing term")?;
+        self.storage
+            .set_voted_for(self.id)
+            .await
+            .context("voting for myself")?;
         self.votes_received = 1;
         self.election_timeout = Self::next_election_timeout(None);
 
@@ -420,12 +436,13 @@ impl StateMachine {
                 peer.client.clone(),
                 id,
                 self.tx_msgs.clone(),
-                self.current_term,
+                self.storage.current_term(),
                 self.id,
-                self.last_log_index(),
-                self.last_log_term(),
+                self.storage.last_log_idx(),
+                self.storage.last_log_term(),
             ));
         }
+        Ok(())
     }
 
     fn convert_to_follower(&mut self) {
@@ -438,19 +455,11 @@ impl StateMachine {
         info!("converting to leader");
         self.state = ServerState::Leader;
         for peer in &mut self.peers {
-            peer.next_idx = self.last_applied_idx + 1;
+            peer.next_idx = self.storage.last_log_idx() + 1;
             peer.update_timeout = None;
             peer.next_heartbeat = Instant::now();
             peer.match_idx = 0;
         }
-    }
-
-    fn last_log_index(&self) -> EntryIdx {
-        self.log.len() //   just to remind that we count indexes from 1
-    }
-
-    fn last_log_term(&self) -> u64 {
-        self.log.last().map_or(0, |e| e.term)
     }
 
     async fn request_vote_from_peer(
@@ -481,14 +490,14 @@ impl StateMachine {
                 error!(
                     candidate = candidate_id,
                     peer_id = peer_id,
-                    error = %err,
+                    error = format!("{err:#}"),
                     "requesting vote from peer",
                 );
             }
         }
     }
 
-    fn send_entries(&mut self, peer: PeerID, entries: Vec<grpc::LogEntry>) {
+    async fn send_entries(&mut self, peer: PeerID, entries: Vec<grpc::LogEntry>) -> Result<()> {
         let mut client = self.peers[peer].client.clone();
         let msgs = self.tx_msgs.clone();
         let _self = format!("{self}");
@@ -501,10 +510,14 @@ impl StateMachine {
         let prev_log_term = if prev_log_idx == 0 {
             0
         } else {
-            self.log[prev_log_idx - 1].term
+            self.storage
+                .get_log_entry(prev_log_idx)
+                .await
+                .context("getting previous log entry")?
+                .term
         };
         let req = grpc::AppendEntriesRequest {
-            term: self.current_term,
+            term: self.storage.current_term(),
             leader_id: self.id as u32,
             prev_log_index: prev_log_idx as u64,
             prev_log_term,
@@ -532,43 +545,69 @@ impl StateMachine {
                         }
                         Err(err) => {
                             // retries are supposed to be part of raft logic itself
-                            error!(follower = peer, error = %err, "sending AppendEntries" );
+                            error!(follower = peer, error = format!("{err:#}"), "sending AppendEntries" );
                         }
                     }
                 }
             }
         });
+
+        Ok(())
     }
 
-    fn get_data(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self.data.get(key).cloned()) // TODO: storage can be shared with grpc layer probably?
+    async fn get_data(
+        &mut self,
+        key: &str,
+        resp: oneshot::Sender<Result<Option<Vec<u8>>>>,
+    ) -> Result<()> {
+        match self
+            .storage
+            .get(key)
+            .await
+            .context("getting data from storage")
+        {
+            Ok(data) => {
+                let _ = resp.send(Ok(data));
+                Ok(())
+            }
+            Err(err) => {
+                let _ = resp.send(Err(anyhow!("{err:#}")));
+                Err(err)
+            }
+        }
     }
-
-    fn set_data(
+    async fn set_data(
         &mut self,
         key: &str,
         value: Vec<u8>,
         resp: oneshot::Sender<Result<Option<Vec<u8>>>>,
-    ) {
-        self.log.push(grpc::LogEntry {
-            term: self.current_term,
-            command: Some(grpc::Command {
-                key: key.to_string(),
-                value,
-            }),
-        });
-        self.peers[self.id].match_idx = self.last_log_index();
+    ) -> Result<()> {
+        if let Err(err) = self
+            .storage
+            .append_to_log(grpc::LogEntry {
+                term: self.storage.current_term(),
+                command: Some(grpc::Command {
+                    key: key.to_string(),
+                    value,
+                }),
+            })
+            .await
+        {
+            let _ = resp.send(Err(anyhow!("saving entry to leader's log: {err:#}")));
+            return Err(anyhow!("saving entry to log: {err:#}"));
+        }
+        self.peers[self.id].match_idx = self.storage.last_log_idx();
 
         // the transaction was inserted to log and will be sent to all followers in next iteration of leader loop
         // following future will wait for it to be commited and will respond to client
         let (tx, mut rx) = oneshot::channel();
-        self.pending_transactions.insert(self.last_log_index(), tx);
+        self.pending_transactions
+            .insert(self.storage.last_log_idx(), tx);
         tokio::spawn(async move {
             select! {
                 // TODO: process client disconnects via cancellation tokens,
                 // otherwise we will be leaking memory in self.pending_transactions
                 tx_result = &mut rx => {
-                    warn!("tx_result");
                     match tx_result {
                         Ok(prev_value) => {
                             let _ = resp.send(Ok(prev_value));
@@ -581,33 +620,44 @@ impl StateMachine {
 
                 },
             }
-            warn!("reporter done");
         });
 
         debug!(index = self.last_applied_idx, "wrote new entry");
+        Ok(())
     }
 
-    fn maybe_apply_log(&mut self) -> bool {
+    async fn maybe_apply_log(&mut self) -> Result<bool> {
         if self.commit_idx <= self.last_applied_idx {
-            return false;
+            return Ok(false);
         }
         self.last_applied_idx += 1;
         debug_assert!(
-            self.last_applied_idx <= self.log.len(),
-            "(applying log entries) last_applied_idx > log length"
+            self.last_applied_idx <= self.storage.last_log_idx(),
+            "(applying log entries) last_applied_idx > log last idx"
         );
 
         debug!(index = self.last_applied_idx, "applying log entry");
-        let cmd = self.log[self.last_applied_idx - 1].command.clone().unwrap();
-        let old_value = self.data.insert(cmd.key, cmd.value);
+        let cmd = self
+            .storage
+            .get_log_entry(self.last_applied_idx)
+            .await
+            .context("fetching latest log entry")?
+            .command
+            .clone()
+            .unwrap();
+        let old_value = self
+            .storage
+            .set(cmd.key, cmd.value)
+            .await
+            .context("applyng log entry to storage")?;
         if let Some(chan) = self.pending_transactions.remove(&self.last_applied_idx) {
             let _ = chan.send(old_value);
         }
-        true
+        Ok(true)
     }
 
-    fn maybe_update_followers(&mut self) -> bool {
-        let last_log_idx = self.last_log_index();
+    async fn maybe_update_followers(&mut self) -> Result<()> {
+        let last_log_idx = self.storage.last_log_idx();
         for peer_id in 0..self.peers.len() {
             if peer_id == self.id {
                 continue;
@@ -623,37 +673,54 @@ impl StateMachine {
                 // peer is lagging
                 debug!(
                     follower = peer_id,
+                    my_last_log_idx = last_log_idx,
                     follower_next_idx = peer.next_idx,
                     "updating follower"
                 );
-                let entries = self.log[peer.next_idx - 1..].to_vec();
-                self.send_entries(peer_id, entries);
+                let entries = self
+                    .storage
+                    .get_logs_since(peer.next_idx)
+                    .await
+                    .context("getting entries for follower")?;
+                self.send_entries(peer_id, entries)
+                    .await
+                    .context("sending entries to follower")?;
             } else if Instant::now() >= peer.next_heartbeat {
-                self.send_entries(peer_id, Vec::new());
+                self.send_entries(peer_id, Vec::new())
+                    .await
+                    .context("sending heartbeat")?;
             }
         }
-        false
+        Ok(())
     }
 
-    fn maybe_update_commit_idx(&mut self) -> bool {
+    async fn maybe_update_commit_idx(&mut self) -> Result<()> {
         debug_assert!(
-            self.commit_idx <= self.last_log_index(),
+            self.commit_idx <= self.storage.last_log_idx(),
             "(updating commitIndex) commitIndex <= log len"
         );
-        if self.commit_idx == self.last_log_index() {
-            return false;
+        if self.commit_idx == self.storage.last_log_idx() {
+            return Ok(());
         }
-        let mut i = self.last_log_index();
+        let mut i = self.storage.last_log_idx();
         while i > self.commit_idx {
             let in_sync = self.peers.iter().filter(|p| p.match_idx >= i).count();
-            if in_sync >= self.quorum as usize && self.log[i - 1].term == self.current_term {
+            if in_sync >= self.quorum as usize
+                && self
+                    .storage
+                    .get_log_entry(i)
+                    .await
+                    .context("getting log entry")?
+                    .term
+                    == self.storage.current_term()
+            {
                 debug!(index = i, in_sync = in_sync, "got quorum on log entry");
                 self.commit_idx = i;
-                return true;
+                return Ok(());
             }
             i -= 1;
         }
-        false
+        Ok(())
     }
 
     fn init_peers(addrs: Vec<String>) -> Result<Vec<PeerState>> {
@@ -683,13 +750,88 @@ impl StateMachine {
 
 #[cfg(test)]
 mod tests {
+    use storage::Store;
+
     use super::*;
 
-    #[test]
-    fn test_append_entries() {
+    pub struct VolatileStore {
+        log: Vec<grpc::LogEntry>,
+        data: HashMap<String, Vec<u8>>,
+        voted_for: Option<usize>,
+        current_term: u64,
+    }
+    impl VolatileStore {
+        pub(crate) fn new() -> Self {
+            Self {
+                log: Vec::new(),
+                data: HashMap::new(),
+                voted_for: None,
+                current_term: 0,
+            }
+        }
+    }
+
+    impl Store for VolatileStore {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            Ok(self.data.get(key).map(|x| x.clone()))
+        }
+
+        async fn set(&mut self, key: String, value: Vec<u8>) -> Result<Option<Vec<u8>>> {
+            Ok(self.data.insert(key, value))
+        }
+
+        fn last_log_idx(&self) -> usize {
+            self.log.len()
+        }
+        fn last_log_term(&self) -> u64 {
+            self.log.last().map(|x| x.term).unwrap_or(0)
+        }
+        fn voted_for(&self) -> Option<usize> {
+            self.voted_for
+        }
+        async fn reset_voted_for(&mut self) -> Result<()> {
+            self.voted_for = None;
+            Ok(())
+        }
+        async fn set_voted_for(&mut self, peer: usize) -> Result<()> {
+            self.voted_for = Some(peer);
+            Ok(())
+        }
+        fn current_term(&self) -> u64 {
+            self.current_term
+        }
+        async fn set_current_term(&mut self, term: u64) -> Result<()> {
+            self.current_term = term;
+            Ok(())
+        }
+        async fn append_to_log(&mut self, entry: grpc::LogEntry) -> Result<()> {
+            self.log.push(entry);
+            Ok(())
+        }
+        async fn get_log_entry(&self, idx: usize) -> Result<grpc::LogEntry> {
+            self.log
+                .get(idx - 1)
+                .map(|x| x.clone())
+                .ok_or(anyhow!("wrong index"))
+        }
+        async fn get_logs_since(&self, start_idx: usize) -> Result<Vec<grpc::LogEntry>> {
+            Ok(self.log[start_idx - 1..]
+                .iter()
+                .map(|x| x.clone())
+                .collect())
+        }
+        async fn truncate_log(&mut self, start_idx: usize) -> Result<()> {
+            self.log.truncate(start_idx);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_append_entries() {
         let (tx, rx) = mpsc::channel(1);
-        let mut sm = StateMachine::new(0, Vec::new(), rx, tx).unwrap();
-        sm.set_term(2);
+        let store = VolatileStore::new();
+        let mut sm = StateMachine::new(0, Vec::new(), store, rx, tx).unwrap();
+        sm.set_term(2).await.unwrap();
         let mut req = grpc::AppendEntriesRequest {
             term: 1,
             leader_id: 0,
@@ -700,14 +842,14 @@ mod tests {
         };
 
         // stale term
-        let mut resp = sm.append_entries(req.clone()).unwrap();
+        let mut resp = sm.append_entries(req.clone()).await.unwrap();
         assert!(!resp.success);
 
         // ok term, no entries
         req.term = 2;
-        resp = sm.append_entries(req.clone()).unwrap();
+        resp = sm.append_entries(req.clone()).await.unwrap();
         assert!(resp.success);
-        assert!(sm.log.is_empty());
+        assert_eq!(sm.storage.last_log_idx(), 0);
 
         // insert entry
         req.leader_commit = 1;
@@ -718,37 +860,57 @@ mod tests {
                 value: "chlos".into(),
             }),
         });
-        resp = sm.append_entries(req.clone()).unwrap();
+        resp = sm.append_entries(req.clone()).await.unwrap();
         assert!(resp.success);
-        assert_eq!(sm.log.len(), 1);
-        assert_eq!(sm.log[0].command.as_ref().unwrap().key, "foo");
+        assert_eq!(sm.storage.last_log_idx(), 1);
+        assert_eq!(
+            sm.storage
+                .get_log_entry(1)
+                .await
+                .unwrap()
+                .command
+                .unwrap()
+                .key,
+            "foo"
+        );
         assert_eq!(sm.commit_idx, 1);
 
         // another entry
         req.leader_commit = 2;
         req.prev_log_index = 1;
         req.prev_log_term = 2;
-        resp = sm.append_entries(req.clone()).unwrap();
+        resp = sm.append_entries(req.clone()).await.unwrap();
         assert!(resp.success);
-        assert_eq!(sm.log.len(), 2);
+        assert_eq!(sm.storage.last_log_idx(), 2);
         assert_eq!(sm.commit_idx, 2);
 
         // TODO: overwrite conflicting entries
-        sm.log.push(grpc::LogEntry {
-            term: 42,
-            command: Some(grpc::Command {
-                key: "wrong".to_string(),
-                value: "wrong".into(),
-            }),
-        });
-        assert_eq!(sm.log[2].command.as_ref().unwrap().key, "wrong");
+        sm.storage
+            .append_to_log(grpc::LogEntry {
+                term: 42,
+                command: Some(grpc::Command {
+                    key: "wrong".to_string(),
+                    value: "wrong".into(),
+                }),
+            })
+            .await
+            .unwrap();
         sm.commit_idx = 3;
         req.leader_commit = 3;
         req.prev_log_index = 2;
-        resp = sm.append_entries(req.clone()).unwrap();
+        resp = sm.append_entries(req.clone()).await.unwrap();
         assert!(resp.success);
-        assert_eq!(sm.log.len(), 3);
+        assert_eq!(sm.storage.last_log_idx(), 3);
         assert_eq!(sm.commit_idx, 3);
-        assert_eq!(sm.log[2].command.as_ref().unwrap().key, "foo");
+        assert_eq!(
+            sm.storage
+                .get_log_entry(2)
+                .await
+                .unwrap()
+                .command
+                .unwrap()
+                .key,
+            "foo"
+        );
     }
 }

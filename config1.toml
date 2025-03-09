@@ -1,5 +1,6 @@
 peer_id = 0
 port = 50051
+data_dir = "db1.db"
 [[peers]]
   addr = "http://[::1]:50051"
 [[peers]]
