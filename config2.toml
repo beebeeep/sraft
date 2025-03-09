@@ -1,11 +1,9 @@
 peer_id = 1
 port = 50052
+data_dir = "db2.db"
 [[peers]]
-  id = 0
   addr = "http://[::1]:50051"
 [[peers]]
-  id = 1
   addr = "http://[::1]:50052"
 [[peers]]
-  id = 2
   addr = "http://[::1]:50053"

@@ -4,7 +4,6 @@ use std::ops::Range;
 use std::time::Duration;
 
 use super::api::grpc::{self, sraft_client::SraftClient};
-use super::storage::NodeStorage;
 use crate::sraft::storage;
 use anyhow::{anyhow, Context, Result};
 use rand::rng;
@@ -16,9 +15,7 @@ use tokio::task;
 use tokio::time;
 use tokio::time::Instant;
 use tonic::transport::Channel;
-use tracing::debug;
-use tracing::warn;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 const IDLE_TIMEOUT: Duration = Duration::from_millis(1500); // time between idling follower heartbeats
 const TICK_TIMEOUT: Duration = Duration::from_millis(300); // main leader loop timeout
@@ -70,7 +67,7 @@ pub enum Message {
     },
 }
 
-pub struct StateMachine {
+pub struct StateMachine<S: storage::Store> {
     id: PeerID,
     rx_msgs: mpsc::Receiver<Message>,
     tx_msgs: mpsc::Sender<Message>,
@@ -84,7 +81,7 @@ pub struct StateMachine {
     // current_term: u64,
     // voted_for: Option<PeerID>,
     // log: Vec<grpc::LogEntry>,
-    storage: storage::NodeStorage,
+    storage: S,
 
     // volatile state
     state: ServerState,
@@ -95,7 +92,7 @@ pub struct StateMachine {
     votes_received: u32,
 }
 
-impl Display for StateMachine {
+impl<S: storage::Store> Display for StateMachine<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -113,32 +110,24 @@ impl Display for StateMachine {
     }
 }
 
-impl StateMachine {
+impl<S: storage::Store + 'static> StateMachine<S> {
     pub fn new(
         id: PeerID,
         peers: Vec<String>,
-        data_dir: &str,
+        store: S,
         rx_msgs: mpsc::Receiver<Message>,
         tx_msgs: mpsc::Sender<Message>,
     ) -> Result<Self> {
-        let store = NodeStorage::new(data_dir).context("opening storage")?;
         Ok(Self {
             id,
             rx_msgs,
             tx_msgs,
-            // data: HashMap::new(),
             quorum: (peers.len() / 2 + 1) as u32,
             peers: Self::init_peers(peers)?,
             election_timeout: Self::next_election_timeout(Some(100..200)),
             pending_transactions: HashMap::new(),
-
-            // current_term: 0,
-            // voted_for: None,
-            // log: Vec::new(),
             storage: store,
-
             votes_received: 0,
-
             state: ServerState::Follower,
             commit_idx: 0,
             last_applied_idx: 0,
@@ -147,13 +136,21 @@ impl StateMachine {
 
     pub async fn run(&mut self) {
         loop {
-            if self.maybe_apply_log() {
-                continue;
+            match self.maybe_apply_log().await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(err) => {
+                    error!(error = format!("{err:#}"), "applying log");
+                }
             }
-            match self.state {
+            let err = match self.state {
                 ServerState::Leader => self.run_leader().await,
                 ServerState::Follower => self.run_follower().await,
                 ServerState::Candidate => self.run_candidate().await,
+            };
+            match err {
+                Ok(_) => {}
+                Err(err) => error!(error = format!("{err:#}"), "got error"),
             }
         }
     }
@@ -167,16 +164,14 @@ impl StateMachine {
             .context("updatting commitIndex")?;
 
         select! {
-            _ = time::sleep(TICK_TIMEOUT) => {
-                Ok(())
-            },
+            _ = time::sleep(TICK_TIMEOUT) => {},
             Some(msg) = self.rx_msgs.recv() => {
                 match msg {
                     Message::Get { key, resp } => {
-                        let _ = resp.send(self.get_data(&key));
+                        self.get_data(&key, resp).await?;
                     }
                     Message::Set { key, value, resp } => {
-                        self.set_data(&key, value, resp);
+                         self.set_data(&key, value, resp).await?;
                     }
                     Message::RequestVote { req, resp } => {
                         let _ = resp.send(self.request_vote(req).await.context("voting for candidate")); // NB: not clear what shall we do here?
@@ -195,7 +190,7 @@ impl StateMachine {
                     },
                     Message::AppendEntriesResponse{peer_id, replicated_index} => {
                         let Some(peer) = self.peers.get_mut(peer_id) else {
-                            return;
+                            return Err(anyhow!("got AppendEntries response from unknown peer {peer_id}"));
                         };
                         if let Some(replicated_index) = replicated_index {
                             debug!(
@@ -217,22 +212,22 @@ impl StateMachine {
                         }
                     }
                 }
-                Ok(())
             }
         }
+        Ok(())
     }
 
-    async fn run_follower(&mut self) {
+    async fn run_follower(&mut self) -> Result<()> {
         select! {
             _ = time::sleep_until(self.election_timeout) => {
-                self.convert_to_candidate();
+                self.convert_to_candidate().await.context("converting to candidate")?;
             },
             Some(msg) = self.rx_msgs.recv() => {
                 match msg {
                     Message::Get { key, resp } => {
                         // NB: reads from followers are eventually consistent and may lag behind leader
                         // even in normal mode (right after leader got quorum and committed write)
-                        let _ = resp.send(self.get_data(&key));
+                        let _ = resp.send(self.storage.get(&key).await);
                     }
                     Message::Set { key: _, value: _, resp } => {
                         let _ = resp.send(Err(anyhow!("i'm follower")));    // TODO: proxy request to leader?
@@ -245,7 +240,7 @@ impl StateMachine {
                     },
                     Message::AppendEntries{req, resp } => {
                         if req.term > self.storage.current_term() {
-                            self.set_term(req.term);
+                            self.set_term(req.term).await.context("setting term")?;
                         }
                         let _ = resp.send(self.append_entries(req).await.context("processing AppendEntries"));
                         warn!(state = %self, "apppplied");
@@ -256,12 +251,13 @@ impl StateMachine {
                 }
             }
         }
+        Ok(())
     }
 
-    async fn run_candidate(&mut self) {
+    async fn run_candidate(&mut self) -> Result<()> {
         select! {
             _ = time::sleep_until(self.election_timeout) => {
-                self.convert_to_candidate();
+                self.convert_to_candidate().await.context("converting to candidate")?;
             },
             Some(msg) = self.rx_msgs.recv() => {
                 match msg {
@@ -277,7 +273,7 @@ impl StateMachine {
                     Message::AppendEntries{req, resp } => {
                         if req.term > self.storage.current_term() {
                             // leader was elected and already send AppendEntries
-                            self.set_term(req.term);
+                            self.set_term(req.term).await.context("setting new term")?;
                             debug!(term = req.term, "got AppendEntries with greater term");
                             self.convert_to_follower();
                         }
@@ -290,7 +286,7 @@ impl StateMachine {
                         info!(votes_received = self.votes_received, vote_granted = vote.vote_granted, "vote result");
                         if vote.term > self.storage.current_term() {
                             // we are stale
-                            self.set_term(vote.term);
+                            self.set_term(vote.term).await.context("setting new term")?;
                             debug!(term = vote.term, "got RequestVote reply with greater term");
                             self.convert_to_follower()
                         } else if vote.term == self.storage.current_term() && vote.vote_granted {
@@ -303,6 +299,7 @@ impl StateMachine {
                 }
             }
         }
+        Ok(())
     }
 
     async fn append_entries(
@@ -344,7 +341,7 @@ impl StateMachine {
                 continue;
             }
 
-            let existing_entry = self.storage.get_log_entry(prev_log_index + i + 1).await?;
+            let existing_entry = self.storage.get_log_entry(prev_log_index + 1 + i).await?;
             if existing_entry.term != entry.term {
                 // conflicting entry, truncate it and all that follow
                 self.storage.truncate_log(prev_log_index + i + 1).await?;
@@ -374,7 +371,7 @@ impl StateMachine {
         }
         if req.term > self.storage.current_term() {
             // candidate is more recent
-            self.set_term(req.term);
+            self.set_term(req.term).await.context("setting new term")?;
             debug!(term = req.term, "got RequestVote with greater term");
             self.convert_to_follower();
         }
@@ -483,7 +480,7 @@ impl StateMachine {
                 error!(
                     candidate = candidate_id,
                     peer_id = peer_id,
-                    error = %err,
+                    error = format!("{err:#}"),
                     "requesting vote from peer",
                 );
             }
@@ -538,7 +535,7 @@ impl StateMachine {
                         }
                         Err(err) => {
                             // retries are supposed to be part of raft logic itself
-                            error!(follower = peer, error = %err, "sending AppendEntries" );
+                            error!(follower = peer, error = format!("{err:#}"), "sending AppendEntries" );
                         }
                     }
                 }
@@ -548,16 +545,33 @@ impl StateMachine {
         Ok(())
     }
 
-    async fn get_data(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        self.storage.get(key).await
+    async fn get_data(
+        &mut self,
+        key: &str,
+        resp: oneshot::Sender<Result<Option<Vec<u8>>>>,
+    ) -> Result<()> {
+        match self
+            .storage
+            .get(key)
+            .await
+            .context("getting data from storage")
+        {
+            Ok(data) => {
+                let _ = resp.send(Ok(data));
+                Ok(())
+            }
+            Err(err) => {
+                let _ = resp.send(Err(anyhow!("{err:#}")));
+                Err(err)
+            }
+        }
     }
-
     async fn set_data(
         &mut self,
         key: &str,
         value: Vec<u8>,
         resp: oneshot::Sender<Result<Option<Vec<u8>>>>,
-    ) {
+    ) -> Result<()> {
         if let Err(err) = self
             .storage
             .append_to_log(grpc::LogEntry {
@@ -569,8 +583,8 @@ impl StateMachine {
             })
             .await
         {
-            resp.send(Err(anyhow!("saving entry to leader's log: {err:#}")));
-            return;
+            let _ = resp.send(Err(anyhow!("saving entry to leader's log: {err:#}")));
+            return Err(anyhow!("saving entry to log: {err:#}"));
         }
         self.peers[self.id].match_idx = self.storage.last_log_idx();
 
@@ -599,6 +613,7 @@ impl StateMachine {
         });
 
         debug!(index = self.last_applied_idx, "wrote new entry");
+        Ok(())
     }
 
     async fn maybe_apply_log(&mut self) -> Result<bool> {
@@ -724,13 +739,16 @@ impl StateMachine {
 
 #[cfg(test)]
 mod tests {
+    use storage::Store;
+
     use super::*;
 
-    #[test]
-    fn test_append_entries() {
+    #[tokio::test]
+    async fn test_append_entries() {
         let (tx, rx) = mpsc::channel(1);
-        let mut sm = StateMachine::new(0, Vec::new(), rx, tx).unwrap();
-        sm.set_term(2);
+        let store = storage::VolatileStore::new();
+        let mut sm = StateMachine::new(0, Vec::new(), store, rx, tx).unwrap();
+        sm.set_term(2).await.unwrap();
         let mut req = grpc::AppendEntriesRequest {
             term: 1,
             leader_id: 0,
@@ -741,14 +759,14 @@ mod tests {
         };
 
         // stale term
-        let mut resp = sm.append_entries(req.clone()).unwrap();
+        let mut resp = sm.append_entries(req.clone()).await.unwrap();
         assert!(!resp.success);
 
         // ok term, no entries
         req.term = 2;
-        resp = sm.append_entries(req.clone()).unwrap();
+        resp = sm.append_entries(req.clone()).await.unwrap();
         assert!(resp.success);
-        assert!(sm.log.is_empty());
+        assert_eq!(sm.storage.last_log_idx(), 0);
 
         // insert entry
         req.leader_commit = 1;
@@ -759,37 +777,57 @@ mod tests {
                 value: "chlos".into(),
             }),
         });
-        resp = sm.append_entries(req.clone()).unwrap();
+        resp = sm.append_entries(req.clone()).await.unwrap();
         assert!(resp.success);
-        assert_eq!(sm.log.len(), 1);
-        assert_eq!(sm.log[0].command.as_ref().unwrap().key, "foo");
+        assert_eq!(sm.storage.last_log_idx(), 1);
+        assert_eq!(
+            sm.storage
+                .get_log_entry(1)
+                .await
+                .unwrap()
+                .command
+                .unwrap()
+                .key,
+            "foo"
+        );
         assert_eq!(sm.commit_idx, 1);
 
         // another entry
         req.leader_commit = 2;
         req.prev_log_index = 1;
         req.prev_log_term = 2;
-        resp = sm.append_entries(req.clone()).unwrap();
+        resp = sm.append_entries(req.clone()).await.unwrap();
         assert!(resp.success);
-        assert_eq!(sm.log.len(), 2);
+        assert_eq!(sm.storage.last_log_idx(), 2);
         assert_eq!(sm.commit_idx, 2);
 
         // TODO: overwrite conflicting entries
-        sm.log.push(grpc::LogEntry {
-            term: 42,
-            command: Some(grpc::Command {
-                key: "wrong".to_string(),
-                value: "wrong".into(),
-            }),
-        });
-        assert_eq!(sm.log[2].command.as_ref().unwrap().key, "wrong");
+        sm.storage
+            .append_to_log(grpc::LogEntry {
+                term: 42,
+                command: Some(grpc::Command {
+                    key: "wrong".to_string(),
+                    value: "wrong".into(),
+                }),
+            })
+            .await
+            .unwrap();
         sm.commit_idx = 3;
         req.leader_commit = 3;
         req.prev_log_index = 2;
-        resp = sm.append_entries(req.clone()).unwrap();
+        resp = sm.append_entries(req.clone()).await.unwrap();
         assert!(resp.success);
-        assert_eq!(sm.log.len(), 3);
+        assert_eq!(sm.storage.last_log_idx(), 3);
         assert_eq!(sm.commit_idx, 3);
-        assert_eq!(sm.log[2].command.as_ref().unwrap().key, "foo");
+        assert_eq!(
+            sm.storage
+                .get_log_entry(2)
+                .await
+                .unwrap()
+                .command
+                .unwrap()
+                .key,
+            "foo"
+        );
     }
 }

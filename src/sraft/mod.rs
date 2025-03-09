@@ -1,5 +1,5 @@
 use crate::config::Config;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use api::grpc;
 use state_machine::{Message, StateMachine};
 use tokio::sync::{mpsc, oneshot};
@@ -16,10 +16,12 @@ pub struct SraftNode {
 impl SraftNode {
     pub fn new(cfg: &Config) -> Result<Self> {
         let (send, recv) = mpsc::channel(8);
+        let store = storage::PersistentStore::new(&cfg.data_dir).context("initializing storage")?;
 
         let mut sm = StateMachine::new(
             cfg.peer_id as usize,
             cfg.peers.iter().map(|x| x.addr.clone()).collect(),
+            store,
             recv,
             send.clone(),
         )?;

@@ -1,14 +1,33 @@
+use std::collections::HashMap;
+
 use anyhow::{anyhow, Context, Result};
 use prost::Message;
 use tokio::task;
+use tracing::debug;
 
 use super::api::grpc;
 
 const KEY_VOTED_FOR: &'static str = "voted_for";
 const KEY_CURRENT_TERM: &'static str = "current_term";
 
-pub struct NodeStorage {
-    keyspace: fjall::Keyspace,
+pub(super) trait Store {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
+    async fn set(&mut self, key: String, value: Vec<u8>) -> Result<Option<Vec<u8>>>;
+    fn last_log_idx(&self) -> usize;
+    fn last_log_term(&self) -> u64;
+    fn voted_for(&self) -> Option<usize>;
+    async fn reset_voted_for(&mut self) -> Result<()>;
+    async fn set_voted_for(&mut self, peer: usize) -> Result<()>;
+    fn current_term(&self) -> u64;
+    async fn set_current_term(&mut self, term: u64) -> Result<()>;
+    async fn append_to_log(&mut self, entry: grpc::LogEntry) -> Result<()>;
+    async fn get_log_entry(&self, idx: usize) -> Result<grpc::LogEntry>;
+    async fn get_logs_since(&self, start_idx: usize) -> Result<Vec<grpc::LogEntry>>;
+    async fn truncate_log(&mut self, start_idx: usize) -> Result<()>;
+}
+
+pub struct PersistentStore {
+    _keyspace: fjall::Keyspace,
     storage: fjall::PartitionHandle,
     log: fjall::PartitionHandle,
     metadata: fjall::PartitionHandle,
@@ -19,7 +38,14 @@ pub struct NodeStorage {
     current_term: u64,
 }
 
-impl NodeStorage {
+pub struct VolatileStore {
+    log: Vec<grpc::LogEntry>,
+    data: HashMap<String, Vec<u8>>,
+    voted_for: Option<usize>,
+    current_term: u64,
+}
+
+impl PersistentStore {
     pub(super) fn new(db_dir: &str) -> Result<Self> {
         let keyspace = fjall::Config::new(db_dir).open().context("opening db")?;
         let storage = keyspace
@@ -51,8 +77,13 @@ impl NodeStorage {
             })
             .unwrap_or(0);
 
+        debug!(
+            log_length = log.approximate_len(),
+            data_length = storage.approximate_len(),
+            "initialized persistent storage"
+        );
         Ok(Self {
-            keyspace,
+            _keyspace: keyspace,
             storage,
             log,
             metadata,
@@ -61,128 +92,6 @@ impl NodeStorage {
             voted_for,
             current_term,
         })
-    }
-
-    pub(super) async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let storage = self.storage.clone();
-        let key = key.to_string();
-        let data = task::spawn_blocking(move || storage.get(key))
-            .await
-            .context("reading from storage")??;
-        Ok(data.map(|r| r.to_vec()))
-    }
-
-    pub(super) async fn set(&self, key: String, value: Vec<u8>) -> Result<Option<Vec<u8>>> {
-        let storage = self.storage.clone();
-        let prev_value = task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
-            let mut prev_value = None;
-            if let Some(v) = storage.get(&key).context("reading from storage")? {
-                prev_value = Some(v.to_vec())
-            }
-            storage.insert(&key, value).context("writing to storage")?;
-            Ok(prev_value)
-        })
-        .await??;
-        Ok(prev_value)
-    }
-
-    pub(super) fn last_log_idx(&self) -> usize {
-        self.last_log_idx
-    }
-
-    pub(super) fn last_log_term(&self) -> u64 {
-        self.last_log_term
-    }
-
-    pub(super) fn voted_for(&self) -> Option<usize> {
-        self.voted_for
-    }
-
-    pub(super) async fn reset_voted_for(&mut self) -> Result<()> {
-        let metadata = self.metadata.clone();
-        task::spawn_blocking(move || metadata.remove(KEY_VOTED_FOR)).await?;
-        self.voted_for = None;
-        Ok(())
-    }
-
-    pub(super) async fn set_voted_for(&mut self, peer: usize) -> Result<()> {
-        let metadata = self.metadata.clone();
-        task::spawn_blocking(move || metadata.insert(KEY_VOTED_FOR, peer.to_be_bytes()))
-            .await
-            .context("saving_to_storage")??;
-        self.voted_for = Some(peer);
-        Ok(())
-    }
-
-    pub(super) fn current_term(&self) -> u64 {
-        self.current_term
-    }
-
-    pub(super) async fn set_current_term(&mut self, term: u64) -> Result<()> {
-        let metadata = self.metadata.clone();
-        task::spawn_blocking(move || metadata.insert(KEY_CURRENT_TERM, term.to_be_bytes()))
-            .await
-            .context("saving_to_storage")??;
-        self.current_term = term;
-        Ok(())
-    }
-
-    pub(super) async fn append_to_log(&mut self, entry: grpc::LogEntry) -> Result<()> {
-        let log = self.log.clone();
-        let last_log_idx = self.last_log_idx + 1;
-        let last_log_term = entry.term;
-        task::spawn_blocking(move || log.insert(last_log_idx.to_be_bytes(), entry.encode_to_vec()))
-            .await
-            .context("writing to storage")??;
-        self.last_log_idx += 1;
-        self.last_log_term = last_log_term;
-        Ok(())
-    }
-
-    pub(super) async fn get_log_entry(&self, idx: usize) -> Result<grpc::LogEntry> {
-        let log = self.log.clone();
-        task::spawn_blocking(move || {
-            match log.get(idx.to_be_bytes()).context("reading storage")? {
-                Some(e) => {
-                    let e = grpc::LogEntry::decode(e.as_ref()).context("decoding log entry")?;
-                    Ok(e)
-                }
-                None => Err(anyhow!("no log entry at {idx}")),
-            }
-        })
-        .await?
-    }
-
-    pub(super) async fn get_logs_since(&self, start_idx: usize) -> Result<Vec<grpc::LogEntry>> {
-        let mut result = Vec::with_capacity(self.last_log_idx - start_idx);
-        for idx in start_idx..=self.last_log_idx {
-            result.push(self.get_log_entry(idx).await?);
-        }
-        Ok(result)
-    }
-
-    pub(super) async fn truncate_log(&mut self, start_idx: usize) -> Result<()> {
-        let log = self.log.clone();
-        let last_idx = self.last_log_idx;
-        let last_term = task::spawn_blocking(move || -> Result<u64> {
-            for idx in start_idx..=last_idx {
-                log.remove(idx.to_be_bytes())
-                    .context("removing log entry")?;
-            }
-            if let Some(e) = log
-                .get((start_idx - 1).to_be_bytes())
-                .context("reading log entry")?
-            {
-                let entry = grpc::LogEntry::decode(e.as_ref()).context("decoding log entry")?;
-                Ok(entry.term)
-            } else {
-                Ok(0)
-            }
-        })
-        .await??;
-        self.last_log_idx = start_idx - 1;
-        self.last_log_term = last_term;
-        Ok(())
     }
 
     // check_log goes through whole log and checks two invariants:
@@ -216,5 +125,195 @@ impl NodeStorage {
             }
         }
         Ok((entry, last_idx))
+    }
+}
+
+impl VolatileStore {
+    pub(crate) fn new() -> Self {
+        Self {
+            log: Vec::new(),
+            data: HashMap::new(),
+            voted_for: None,
+            current_term: 0,
+        }
+    }
+}
+
+impl Store for PersistentStore {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let storage = self.storage.clone();
+        let key = key.to_string();
+        let data = task::spawn_blocking(move || storage.get(key))
+            .await
+            .context("reading from storage")??;
+        Ok(data.map(|r| r.to_vec()))
+    }
+
+    async fn set(&mut self, key: String, value: Vec<u8>) -> Result<Option<Vec<u8>>> {
+        let storage = self.storage.clone();
+        let prev_value = task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+            let mut prev_value = None;
+            if let Some(v) = storage.get(&key).context("reading from storage")? {
+                prev_value = Some(v.to_vec())
+            }
+            storage.insert(&key, value).context("writing to storage")?;
+            Ok(prev_value)
+        })
+        .await??;
+        Ok(prev_value)
+    }
+
+    fn last_log_idx(&self) -> usize {
+        self.last_log_idx
+    }
+
+    fn last_log_term(&self) -> u64 {
+        self.last_log_term
+    }
+
+    fn voted_for(&self) -> Option<usize> {
+        self.voted_for
+    }
+
+    async fn reset_voted_for(&mut self) -> Result<()> {
+        let metadata = self.metadata.clone();
+        task::spawn_blocking(move || metadata.remove(KEY_VOTED_FOR)).await??;
+        self.voted_for = None;
+        Ok(())
+    }
+
+    async fn set_voted_for(&mut self, peer: usize) -> Result<()> {
+        let metadata = self.metadata.clone();
+        task::spawn_blocking(move || metadata.insert(KEY_VOTED_FOR, peer.to_be_bytes()))
+            .await
+            .context("saving_to_storage")??;
+        self.voted_for = Some(peer);
+        Ok(())
+    }
+
+    fn current_term(&self) -> u64 {
+        self.current_term
+    }
+
+    async fn set_current_term(&mut self, term: u64) -> Result<()> {
+        let metadata = self.metadata.clone();
+        task::spawn_blocking(move || metadata.insert(KEY_CURRENT_TERM, term.to_be_bytes()))
+            .await
+            .context("saving_to_storage")??;
+        self.current_term = term;
+        Ok(())
+    }
+
+    async fn append_to_log(&mut self, entry: grpc::LogEntry) -> Result<()> {
+        let log = self.log.clone();
+        let last_log_idx = self.last_log_idx + 1;
+        let last_log_term = entry.term;
+        task::spawn_blocking(move || log.insert(last_log_idx.to_be_bytes(), entry.encode_to_vec()))
+            .await
+            .context("writing to storage")??;
+        self.last_log_idx += 1;
+        self.last_log_term = last_log_term;
+        Ok(())
+    }
+
+    async fn get_log_entry(&self, idx: usize) -> Result<grpc::LogEntry> {
+        let log = self.log.clone();
+        task::spawn_blocking(move || {
+            match log.get(idx.to_be_bytes()).context("reading storage")? {
+                Some(e) => {
+                    let e = grpc::LogEntry::decode(e.as_ref()).context("decoding log entry")?;
+                    Ok(e)
+                }
+                None => Err(anyhow!("no log entry at {idx}")),
+            }
+        })
+        .await?
+    }
+
+    async fn get_logs_since(&self, start_idx: usize) -> Result<Vec<grpc::LogEntry>> {
+        let mut result = Vec::with_capacity(self.last_log_idx - start_idx);
+        for idx in start_idx..=self.last_log_idx {
+            result.push(self.get_log_entry(idx).await?);
+        }
+        Ok(result)
+    }
+
+    async fn truncate_log(&mut self, start_idx: usize) -> Result<()> {
+        let log = self.log.clone();
+        let last_idx = self.last_log_idx;
+        let last_term = task::spawn_blocking(move || -> Result<u64> {
+            for idx in start_idx..=last_idx {
+                log.remove(idx.to_be_bytes())
+                    .context("removing log entry")?;
+            }
+            if let Some(e) = log
+                .get((start_idx - 1).to_be_bytes())
+                .context("reading log entry")?
+            {
+                let entry = grpc::LogEntry::decode(e.as_ref()).context("decoding log entry")?;
+                Ok(entry.term)
+            } else {
+                Ok(0)
+            }
+        })
+        .await??;
+        self.last_log_idx = start_idx - 1;
+        self.last_log_term = last_term;
+        Ok(())
+    }
+}
+
+impl Store for VolatileStore {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.data.get(key).map(|x| x.clone()))
+    }
+
+    async fn set(&mut self, key: String, value: Vec<u8>) -> Result<Option<Vec<u8>>> {
+        Ok(self.data.insert(key, value))
+    }
+
+    fn last_log_idx(&self) -> usize {
+        self.log.len()
+    }
+    fn last_log_term(&self) -> u64 {
+        self.log.last().map(|x| x.term).unwrap_or(0)
+    }
+    fn voted_for(&self) -> Option<usize> {
+        self.voted_for
+    }
+    async fn reset_voted_for(&mut self) -> Result<()> {
+        self.voted_for = None;
+        Ok(())
+    }
+    async fn set_voted_for(&mut self, peer: usize) -> Result<()> {
+        self.voted_for = Some(peer);
+        Ok(())
+    }
+    fn current_term(&self) -> u64 {
+        self.current_term
+    }
+    async fn set_current_term(&mut self, term: u64) -> Result<()> {
+        self.current_term = term;
+        Ok(())
+    }
+    async fn append_to_log(&mut self, entry: grpc::LogEntry) -> Result<()> {
+        self.log.push(entry);
+        Ok(())
+    }
+    async fn get_log_entry(&self, idx: usize) -> Result<grpc::LogEntry> {
+        self.log
+            .get(idx - 1)
+            .map(|x| x.clone())
+            .ok_or(anyhow!("wrong index"))
+    }
+    async fn get_logs_since(&self, start_idx: usize) -> Result<Vec<grpc::LogEntry>> {
+        Ok(self.log[start_idx - 1..]
+            .iter()
+            .map(|x| x.clone())
+            .collect())
+    }
+    async fn truncate_log(&mut self, start_idx: usize) -> Result<()> {
+        self.log.truncate(start_idx);
+        Ok(())
     }
 }
