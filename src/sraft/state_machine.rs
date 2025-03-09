@@ -161,7 +161,7 @@ impl<S: storage::Store + 'static> StateMachine<S> {
             .context("updating followers")?;
         self.maybe_update_commit_idx()
             .await
-            .context("updatting commitIndex")?;
+            .context("updating commitIndex")?;
 
         select! {
             _ = time::sleep(TICK_TIMEOUT) => {},
@@ -243,7 +243,6 @@ impl<S: storage::Store + 'static> StateMachine<S> {
                             self.set_term(req.term).await.context("setting term")?;
                         }
                         let _ = resp.send(self.append_entries(req).await.context("processing AppendEntries"));
-                        warn!(state = %self, "apppplied");
                     },
                     Message::AppendEntriesResponse{ .. } => {
                         // don't care as follower
@@ -306,7 +305,6 @@ impl<S: storage::Store + 'static> StateMachine<S> {
         &mut self,
         req: grpc::AppendEntriesRequest,
     ) -> Result<grpc::AppendEntriesResponse> {
-        debug!("appendEntries");
         if req.term < self.storage.current_term() {
             // stale leader, reject RPC
             return Ok(grpc::AppendEntriesResponse {
@@ -317,6 +315,7 @@ impl<S: storage::Store + 'static> StateMachine<S> {
         debug!(
             leader_commit = req.leader_commit,
             entries_count = req.entries.len(),
+            prev_log_idx = req.prev_log_index,
             "AppendEntries"
         );
         self.election_timeout = Self::next_election_timeout(None);
@@ -336,15 +335,26 @@ impl<S: storage::Store + 'static> StateMachine<S> {
         }
 
         for (i, entry) in req.entries.into_iter().enumerate() {
-            if self.storage.last_log_idx() < i + prev_log_index {
-                self.storage.append_to_log(entry).await?;
+            let next_entry_idx = prev_log_index + 1 + i;
+            if self.storage.last_log_idx() < next_entry_idx {
+                self.storage
+                    .append_to_log(entry)
+                    .await
+                    .context("appending log entry")?;
                 continue;
             }
 
-            let existing_entry = self.storage.get_log_entry(prev_log_index + 1 + i).await?;
+            let existing_entry = self
+                .storage
+                .get_log_entry(next_entry_idx)
+                .await
+                .context("getting existing log entry")?;
             if existing_entry.term != entry.term {
                 // conflicting entry, truncate it and all that follow
-                self.storage.truncate_log(prev_log_index + i + 1).await?;
+                self.storage
+                    .truncate_log(next_entry_idx)
+                    .await
+                    .context("removing conflicting entries from log")?;
             }
         }
 
@@ -445,7 +455,7 @@ impl<S: storage::Store + 'static> StateMachine<S> {
         info!("converting to leader");
         self.state = ServerState::Leader;
         for peer in &mut self.peers {
-            peer.next_idx = self.last_applied_idx + 1;
+            peer.next_idx = self.storage.last_log_idx() + 1;
             peer.update_timeout = None;
             peer.next_heartbeat = Instant::now();
             peer.match_idx = 0;
@@ -663,12 +673,13 @@ impl<S: storage::Store + 'static> StateMachine<S> {
                 // peer is lagging
                 debug!(
                     follower = peer_id,
+                    my_last_log_idx = last_log_idx,
                     follower_next_idx = peer.next_idx,
                     "updating follower"
                 );
                 let entries = self
                     .storage
-                    .get_logs_since(peer.next_idx - 1)
+                    .get_logs_since(peer.next_idx)
                     .await
                     .context("getting entries for follower")?;
                 self.send_entries(peer_id, entries)
@@ -697,7 +708,7 @@ impl<S: storage::Store + 'static> StateMachine<S> {
             if in_sync >= self.quorum as usize
                 && self
                     .storage
-                    .get_log_entry(i - 1)
+                    .get_log_entry(i)
                     .await
                     .context("getting log entry")?
                     .term
@@ -743,10 +754,82 @@ mod tests {
 
     use super::*;
 
+    pub struct VolatileStore {
+        log: Vec<grpc::LogEntry>,
+        data: HashMap<String, Vec<u8>>,
+        voted_for: Option<usize>,
+        current_term: u64,
+    }
+    impl VolatileStore {
+        pub(crate) fn new() -> Self {
+            Self {
+                log: Vec::new(),
+                data: HashMap::new(),
+                voted_for: None,
+                current_term: 0,
+            }
+        }
+    }
+
+    impl Store for VolatileStore {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            Ok(self.data.get(key).map(|x| x.clone()))
+        }
+
+        async fn set(&mut self, key: String, value: Vec<u8>) -> Result<Option<Vec<u8>>> {
+            Ok(self.data.insert(key, value))
+        }
+
+        fn last_log_idx(&self) -> usize {
+            self.log.len()
+        }
+        fn last_log_term(&self) -> u64 {
+            self.log.last().map(|x| x.term).unwrap_or(0)
+        }
+        fn voted_for(&self) -> Option<usize> {
+            self.voted_for
+        }
+        async fn reset_voted_for(&mut self) -> Result<()> {
+            self.voted_for = None;
+            Ok(())
+        }
+        async fn set_voted_for(&mut self, peer: usize) -> Result<()> {
+            self.voted_for = Some(peer);
+            Ok(())
+        }
+        fn current_term(&self) -> u64 {
+            self.current_term
+        }
+        async fn set_current_term(&mut self, term: u64) -> Result<()> {
+            self.current_term = term;
+            Ok(())
+        }
+        async fn append_to_log(&mut self, entry: grpc::LogEntry) -> Result<()> {
+            self.log.push(entry);
+            Ok(())
+        }
+        async fn get_log_entry(&self, idx: usize) -> Result<grpc::LogEntry> {
+            self.log
+                .get(idx - 1)
+                .map(|x| x.clone())
+                .ok_or(anyhow!("wrong index"))
+        }
+        async fn get_logs_since(&self, start_idx: usize) -> Result<Vec<grpc::LogEntry>> {
+            Ok(self.log[start_idx - 1..]
+                .iter()
+                .map(|x| x.clone())
+                .collect())
+        }
+        async fn truncate_log(&mut self, start_idx: usize) -> Result<()> {
+            self.log.truncate(start_idx);
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn test_append_entries() {
         let (tx, rx) = mpsc::channel(1);
-        let store = storage::VolatileStore::new();
+        let store = VolatileStore::new();
         let mut sm = StateMachine::new(0, Vec::new(), store, rx, tx).unwrap();
         sm.set_term(2).await.unwrap();
         let mut req = grpc::AppendEntriesRequest {

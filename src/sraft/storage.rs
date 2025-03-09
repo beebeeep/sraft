@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use anyhow::{anyhow, Context, Result};
 use prost::Message;
 use tokio::task;
@@ -34,13 +32,6 @@ pub struct PersistentStore {
 
     last_log_idx: usize,
     last_log_term: u64,
-    voted_for: Option<usize>,
-    current_term: u64,
-}
-
-pub struct VolatileStore {
-    log: Vec<grpc::LogEntry>,
-    data: HashMap<String, Vec<u8>>,
     voted_for: Option<usize>,
     current_term: u64,
 }
@@ -128,17 +119,6 @@ impl PersistentStore {
     }
 }
 
-impl VolatileStore {
-    pub(crate) fn new() -> Self {
-        Self {
-            log: Vec::new(),
-            data: HashMap::new(),
-            voted_for: None,
-            current_term: 0,
-        }
-    }
-}
-
 impl Store for PersistentStore {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let storage = self.storage.clone();
@@ -206,11 +186,16 @@ impl Store for PersistentStore {
 
     async fn append_to_log(&mut self, entry: grpc::LogEntry) -> Result<()> {
         let log = self.log.clone();
-        let last_log_idx = self.last_log_idx + 1;
+        let next_idx = self.last_log_idx + 1;
         let last_log_term = entry.term;
-        task::spawn_blocking(move || log.insert(last_log_idx.to_be_bytes(), entry.encode_to_vec()))
+        task::spawn_blocking(move || log.insert(next_idx.to_be_bytes(), entry.encode_to_vec()))
             .await
             .context("writing to storage")??;
+        debug!(
+            idx = self.last_log_idx + 1,
+            term = last_log_term,
+            "added entry to log"
+        );
         self.last_log_idx += 1;
         self.last_log_term = last_log_term;
         Ok(())
@@ -259,61 +244,6 @@ impl Store for PersistentStore {
         .await??;
         self.last_log_idx = start_idx - 1;
         self.last_log_term = last_term;
-        Ok(())
-    }
-}
-
-impl Store for VolatileStore {
-    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self.data.get(key).map(|x| x.clone()))
-    }
-
-    async fn set(&mut self, key: String, value: Vec<u8>) -> Result<Option<Vec<u8>>> {
-        Ok(self.data.insert(key, value))
-    }
-
-    fn last_log_idx(&self) -> usize {
-        self.log.len()
-    }
-    fn last_log_term(&self) -> u64 {
-        self.log.last().map(|x| x.term).unwrap_or(0)
-    }
-    fn voted_for(&self) -> Option<usize> {
-        self.voted_for
-    }
-    async fn reset_voted_for(&mut self) -> Result<()> {
-        self.voted_for = None;
-        Ok(())
-    }
-    async fn set_voted_for(&mut self, peer: usize) -> Result<()> {
-        self.voted_for = Some(peer);
-        Ok(())
-    }
-    fn current_term(&self) -> u64 {
-        self.current_term
-    }
-    async fn set_current_term(&mut self, term: u64) -> Result<()> {
-        self.current_term = term;
-        Ok(())
-    }
-    async fn append_to_log(&mut self, entry: grpc::LogEntry) -> Result<()> {
-        self.log.push(entry);
-        Ok(())
-    }
-    async fn get_log_entry(&self, idx: usize) -> Result<grpc::LogEntry> {
-        self.log
-            .get(idx - 1)
-            .map(|x| x.clone())
-            .ok_or(anyhow!("wrong index"))
-    }
-    async fn get_logs_since(&self, start_idx: usize) -> Result<Vec<grpc::LogEntry>> {
-        Ok(self.log[start_idx - 1..]
-            .iter()
-            .map(|x| x.clone())
-            .collect())
-    }
-    async fn truncate_log(&mut self, start_idx: usize) -> Result<()> {
-        self.log.truncate(start_idx);
         Ok(())
     }
 }
