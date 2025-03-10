@@ -100,7 +100,7 @@ impl PersistentStore {
                     entry = grpc::LogEntry::decode(vs.as_ref()).context("decoding message")?;
 
                     if entry.term < prev_term {
-                        return Err(anyhow!("invalid log entry at {idx}: term {} is les than in term of previous entries", entry.term));
+                        return Err(anyhow!("invalid log entry at {idx}: term {} is less than in term of previous entries", entry.term));
                     }
                     prev_term = entry.term;
                     buf.copy_from_slice(&ks);

@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = format!(
         "{}:{}",
-        cfg.host.clone().unwrap_or(String::from("[::1]")),
+        cfg.host.clone().unwrap_or(String::from("[::]")),
         cfg.port
     )
     .parse()?;
