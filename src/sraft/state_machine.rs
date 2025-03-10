@@ -119,7 +119,7 @@ impl<S: storage::Store + 'static> StateMachine<S> {
             tx_msgs,
             quorum: (peers.len() / 2 + 1) as u32,
             peers: Self::init_peers(peers)?,
-            election_timeout: Self::next_election_timeout(Some(100..200)),
+            election_timeout: Self::next_election_timeout(Some(100..200)), // such short timeout may cause unnecessary elections on startup (also it's bugged)
             pending_transactions: HashMap::new(),
             storage: store,
             votes_received: 0,
